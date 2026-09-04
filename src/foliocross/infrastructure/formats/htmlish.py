@@ -6,16 +6,62 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 from ...domain.models import ChapterDraft, ParsedBook, SegmentDraft
-from .markers import replace_block_contents, serialize_block
+from ...errors import FolioCrossError
+from .markers import MARKER_PATTERN, replace_block_contents, serialize_block
 
 BLOCK_SELECTOR = "h1,h2,h3,h4,h5,h6,p,li,blockquote,figcaption,td,th"
+BLOCK_NAMES = set(BLOCK_SELECTOR.split(","))
+DIRECT_BLOCK_ATTR = "data-foliocross-direct"
+
+
+def _wrap_direct_content(soup: BeautifulSoup, candidates: list[Tag]) -> None:
+    """Expose prose beside nested blocks without flattening or duplicating child blocks."""
+
+    for parent in candidates:
+        if not parent.select_one(BLOCK_SELECTOR):
+            continue
+        group: list[Tag | NavigableString] = []
+
+        def flush() -> None:
+            nonlocal group
+            if not group:
+                return
+            visible = BeautifulSoup("".join(str(item) for item in group), "html.parser").get_text(
+                " ", strip=True
+            )
+            if visible:
+                wrapper = soup.new_tag("span")
+                wrapper[DIRECT_BLOCK_ATTR] = "1"
+                group[0].insert_before(wrapper)
+                for node in group:
+                    wrapper.append(node.extract())
+            group = []
+
+        for child in list(parent.contents):
+            contains_block = isinstance(child, Tag) and (
+                child.name in BLOCK_NAMES or child.select_one(BLOCK_SELECTOR)
+            )
+            if contains_block:
+                flush()
+            else:
+                group.append(child)
+        flush()
 
 
 def content_blocks(soup: BeautifulSoup) -> list[Tag]:
-    blocks = [item for item in soup.select(BLOCK_SELECTOR) if isinstance(item, Tag)]
+    candidates = [item for item in soup.select(BLOCK_SELECTOR) if isinstance(item, Tag)]
+    _wrap_direct_content(soup, candidates)
+    candidates = [
+        item
+        for item in soup.select(f"{BLOCK_SELECTOR},span[{DIRECT_BLOCK_ATTR}]")
+        if isinstance(item, Tag)
+    ]
+    # A blockquote, list item or table cell often contains paragraph blocks. Translating
+    # both the parent and the child duplicates the same prose and breaks template mapping.
+    blocks = [item for item in candidates if not item.select_one(BLOCK_SELECTOR)]
     if blocks:
         return blocks
     return [
@@ -23,6 +69,11 @@ def content_blocks(soup: BeautifulSoup) -> list[Tag]:
         for item in soup.find_all(["div", "section"])
         if isinstance(item, Tag) and not item.find(["div", "section", "p"])
     ]
+
+
+def remove_internal_wrappers(soup: BeautifulSoup) -> None:
+    for wrapper in list(soup.select(f"span[{DIRECT_BLOCK_ATTR}]")):
+        wrapper.unwrap()
 
 
 def extract_html_chapter(
@@ -37,7 +88,7 @@ def extract_html_chapter(
     title = ""
     for ordinal, block in enumerate(content_blocks(soup)):
         text, markers = serialize_block(block, identity=f"{resource}:{ordinal}")
-        visible = text.strip()
+        visible = MARKER_PATTERN.sub("", text).strip()
         if not visible:
             continue
         if not title and block.name and block.name.lower().startswith("h"):
@@ -72,17 +123,31 @@ def fill_html_template(
     blocks = content_blocks(soup)
     grouped: dict[int, list[dict]] = defaultdict(list)
     for segment in segments:
-        grouped[int(segment["locator"]["ordinal"])].append(segment)
+        locator = segment.get("locator") or {}
+        if "ordinal" not in locator:
+            raise FolioCrossError("html_mapping_incomplete", "有段落缺少有效的 HTML 原位定位信息。")
+        grouped[int(locator["ordinal"])].append(segment)
     for ordinal, parts in grouped.items():
-        if ordinal >= len(blocks):
-            continue
+        if ordinal < 0 or ordinal >= len(blocks):
+            raise FolioCrossError(
+                "html_mapping_incomplete", f"HTML 正文定位已失效：找不到第 {ordinal + 1} 个段落。"
+            )
         parts.sort(key=lambda item: int(item["locator"].get("logical_part", 0)))
         target = "".join(item["target_text"] or item["source_text"] for item in parts)
         source = "".join(item["source_text"] for item in parts)
+        fresh_source, _ = serialize_block(
+            blocks[ordinal], identity=f"{Path(source_path).name}:{ordinal}"
+        )
+        if fresh_source != source:
+            raise FolioCrossError(
+                "html_source_changed",
+                f"HTML 第 {ordinal + 1} 个段落与导入时的原文不一致，已停止导出。",
+            )
         markers = [marker for item in parts for marker in item["markers"]]
         if bilingual:
             target = f"{target}\n{source}"
         replace_block_contents(blocks[ordinal], target, markers)
+    remove_internal_wrappers(soup)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_text(str(soup), encoding="utf-8")
     return output_path

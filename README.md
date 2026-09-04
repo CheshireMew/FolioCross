@@ -10,12 +10,13 @@ FolioCross 是一个本地优先的整本书翻译工作台。它把图书解析
 
 - 输入：EPUB、MOBI、AZW/AZW3/AZW4、FB2、HTML、TXT、Markdown、DOCX。
 - 输出：EPUB、DOCX、HTML、TXT、Markdown。
-- EPUB 以原书为模板回填，保留包结构、目录、CSS、图片、锚点和脚注。
-- MOBI/AZW3 通过独立的 Calibre `ebook-convert` 转换，缓存按原文件 SHA-256 隔离。
-- 多本任务、断点续跑、安全暂停、人工段落锁、版本历史和质量问题列表。
+- EPUB 以原书为模板回填，保留包结构、CSS、图片、锚点和脚注，并同步翻译目录标题。
+- MOBI/AZW3 默认通过独立 KindleUnpack 环境转换，Calibre 只是兼容性兜底；规范化 EPUB 按原文件 SHA-256 缓存。
+- 多本任务自动排队、断点续跑、安全暂停、人工段落锁、撤销/恢复、版本对比和质量问题列表。
 - 新建任务时可先查看 token/费用估算，直接开始或只完成译前准备后暂停。
 - 单段重译、历史恢复、术语显式批量应用和用户主动启动的深度审校。
-- 每次模型调用都记录实际模型、阶段、token、缓存、重试和可计算费用。
+- 每次模型调用都记录实际模型、阶段、章节、token、缓存、重试和可计算费用，并可查看请求明细。
+- 桌面端提供简体中文和英文界面、界面缩放、封面、应用内预览与完成通知。
 - 提供稳定 JSON CLI，并支持只读导入 Wenyi v0.5.2 状态。
 
 PDF、SRT、云端账户、团队协作和内置聊天不在当前范围内。
@@ -35,8 +36,19 @@ D:\Tools\uv\Scripts\uv.exe run foliocross doctor
 D:\Tools\uv\Scripts\uv.exe run foliocross app
 ```
 
-本机的 Calibre 便携版位于 `D:\Tools\Calibre\Calibre Portable`；FolioCross 会自动发现其中的
-`ebook-convert.exe`。Calibre 不进入仓库，也不与 FolioCross 源码合并。
+本机 KindleUnpack 独立环境位于 `D:\Tools\venvs\FolioCross-KindleUnpack`。它负责无 DRM 的
+MOBI/KF8 拆包；FolioCross 只启动其独立进程，不把 GPL 代码放入 MIT 项目。Calibre 便携版位于
+`D:\Tools\Calibre\Calibre Portable`，只在 KindleUnpack 失败时作为可选兜底。两者都不进入仓库。
+
+若另一台 Windows 机器没有这个独立环境，可在 D 盘创建：
+
+```powershell
+D:\Tools\Python310\python.exe -m venv D:\Tools\venvs\FolioCross-KindleUnpack
+D:\Tools\venvs\FolioCross-KindleUnpack\Scripts\python.exe -m pip install mobi==0.4.1
+```
+
+也可以用 `FOLIOCROSS_KINDLEUNPACK_PYTHON` 指向其他独立环境的 `python.exe`。两种 Kindle
+后端都没有安装时，EPUB、DOCX、FB2、HTML 和文本格式仍可正常使用。
 
 默认工作区是仓库下的 `workspace/`，整目录已被 Git 忽略。可以通过
 `--workspace` 或 `FOLIOCROSS_WORKSPACE` 改用其他位置。
@@ -69,6 +81,11 @@ foliocross jobs status <job-id> --json
 foliocross jobs pause <job-id> --json
 foliocross jobs resume <job-id> --json
 
+# 导入、导出并明确刷新冻结术语版本
+foliocross glossary import <book-or-job-id> terms.json --json
+foliocross glossary export <book-or-job-id> --output terms.json --json
+foliocross glossary refresh <book-or-job-id> --json
+
 # 重新导出
 foliocross export <job-id> --format epub --json
 
@@ -97,4 +114,4 @@ git diff --check
 ```
 
 FolioCross 采用 MIT 许可证。部分格式处理思路改编自 MIT 许可的 Wenyi v0.5.2，
-详见 [NOTICE](NOTICE)。Calibre 是独立外部应用，不随 FolioCross 源码合并。
+详见 [NOTICE](NOTICE)。KindleUnpack 和 Calibre 都是独立外部工具，不随 FolioCross 源码合并。

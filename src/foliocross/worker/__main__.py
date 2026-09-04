@@ -41,6 +41,14 @@ def main() -> None:
     except FolioCrossError as error:
         print(json.dumps(error.as_dict(), ensure_ascii=False), file=sys.stderr)
         raise SystemExit(1) from None
+    except Exception as error:
+        wrapped = FolioCrossError(
+            "operation_failed",
+            str(error) or "Worker 操作失败。",
+            details={"exception": type(error).__name__},
+        )
+        print(json.dumps(wrapped.as_dict(), ensure_ascii=False), file=sys.stderr)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ from ...errors import FolioCrossError
 from .docx import export_docx_template
 from .epub import export_epub_template
 from .htmlish import fill_html_template
+from .markers import MARKER_PATTERN
 
 SUPPORTED_OUTPUTS = {"epub", "docx", "html", "txt", "markdown"}
 
@@ -25,8 +26,9 @@ def _chapter_rows(repository, job_id: str) -> list[tuple[dict, list[dict]]]:
 
 
 def _display_text(segment: dict, bilingual: bool) -> str:
-    target = segment["target_text"] or segment["source_text"]
-    return f"{target}\n{segment['source_text']}" if bilingual else target
+    target = MARKER_PATTERN.sub("", segment["target_text"] or segment["source_text"])
+    source = MARKER_PATTERN.sub("", segment["source_text"])
+    return f"{target}\n{source}" if bilingual else target
 
 
 def _chapter_content(chapter: dict, segments: list[dict]) -> tuple[str, list[dict]]:
@@ -35,10 +37,14 @@ def _chapter_content(chapter: dict, segments: list[dict]) -> tuple[str, list[dic
     if not segments:
         return chapter["title"], segments
     first = segments[0]
-    source_heading = re.sub(r"^#{1,6}\s+", "", first["source_text"].strip())
+    source_heading = re.sub(r"^#{1,6}\s+", "", MARKER_PATTERN.sub("", first["source_text"]).strip())
     if source_heading != chapter["title"].strip():
         return chapter["title"], segments
-    translated = re.sub(r"^#{1,6}\s+", "", (first["target_text"] or source_heading).strip())
+    translated = re.sub(
+        r"^#{1,6}\s+",
+        "",
+        MARKER_PATTERN.sub("", first["target_text"] or source_heading).strip(),
+    )
     return translated or chapter["title"], segments[1:]
 
 
@@ -73,10 +79,13 @@ def _write_html(
         if bilingual and chapter_title != chapter["title"]:
             body.append(f'<p class="source">{html.escape(chapter["title"])}</p>')
         for segment in content:
-            target = html.escape(segment["target_text"] or segment["source_text"])
+            target = html.escape(
+                MARKER_PATTERN.sub("", segment["target_text"] or segment["source_text"])
+            )
             body.append(f'<p class="target">{target}</p>')
             if bilingual:
-                body.append(f'<p class="source">{html.escape(segment["source_text"])}</p>')
+                source = html.escape(MARKER_PATTERN.sub("", segment["source_text"]))
+                body.append(f'<p class="source">{source}</p>')
         body.append("</section>")
     document = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>{html.escape(title)}</title>

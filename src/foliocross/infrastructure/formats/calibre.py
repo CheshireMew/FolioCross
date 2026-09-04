@@ -68,7 +68,7 @@ def find_ebook_convert(configured_path: str | None = None) -> str:
     )
 
 
-def _valid_epub(path: Path) -> bool:
+def valid_epub(path: Path) -> bool:
     if not path.is_file() or not zipfile.is_zipfile(path):
         return False
     with zipfile.ZipFile(path) as archive:
@@ -83,7 +83,7 @@ def convert_to_epub(
     timeout: float = 900,
 ) -> str:
     target = Path(output_path)
-    if _valid_epub(target):
+    if valid_epub(target):
         return str(target)
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_suffix(".part.epub")
@@ -105,7 +105,7 @@ def convert_to_epub(
     except subprocess.TimeoutExpired as error:
         raise FolioCrossError("calibre_timeout", f"电子书格式转换超过 {timeout:g} 秒。") from error
     output = (result.stdout or "").strip()
-    if result.returncode != 0 or not _valid_epub(partial):
+    if result.returncode != 0 or not valid_epub(partial):
         detail = output[-2000:] or "未生成有效 EPUB"
         if re.search(r"\bdrm\b|encrypted|locked", detail, re.IGNORECASE):
             raise FolioCrossError(

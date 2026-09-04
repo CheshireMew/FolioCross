@@ -18,6 +18,12 @@ def main() -> None:
         result = service.import_book(args.path, service.default_job_config())
     except FolioCrossError as error:
         result = error.as_dict()
+    except Exception as error:
+        result = FolioCrossError(
+            "operation_failed",
+            str(error) or "导入失败。",
+            details={"exception": type(error).__name__},
+        ).as_dict()
     print(json.dumps(result, ensure_ascii=False))
 
 

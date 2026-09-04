@@ -34,8 +34,13 @@ def serialize_block(block: Tag, *, identity: str) -> tuple[str, list[dict[str, A
         name = node.name.lower()
         marker_identity = f"{identity}:{path}:{name}:{len(markers)}"
         epub_type = str(node.attrs.get("epub:type", ""))
+        role = str(node.attrs.get("role", ""))
+        classes = " ".join(node.get("class", []))
         is_noteref = name == "a" and (
-            "noteref" in epub_type or "footnote" in " ".join(node.get("class", []))
+            "noteref" in epub_type
+            or "doc-noteref" in role
+            or "noteref" in classes
+            or "footnote" in classes
         )
         if name in SELF_TAGS or is_noteref:
             token = _token("NOTE" if is_noteref else "ATOM", marker_identity, "X")
@@ -48,30 +53,32 @@ def serialize_block(block: Tag, *, identity: str) -> tuple[str, list[dict[str, A
                 }
             )
             return token
-        inner = "".join(walk(child, f"{path}.{index}") for index, child in enumerate(node.children))
         if name not in INLINE_TAGS:
-            return inner
+            return "".join(
+                walk(child, f"{path}.{index}") for index, child in enumerate(node.children)
+            )
+        insertion_index = len(markers)
         start = _token("TAG", marker_identity, "S")
         end = _token("TAG", marker_identity, "E")
         attrs = "".join(
             f' {key}="{html.escape(" ".join(value) if isinstance(value, list) else str(value), quote=True)}"'
             for key, value in node.attrs.items()
         )
-        markers.extend(
-            [
-                {
-                    "token": start,
-                    "html": f"<{name}{attrs}>",
-                    "kind": "tag_start",
-                    "source_offset": visible_count,
-                },
-                {
-                    "token": end,
-                    "html": f"</{name}>",
-                    "kind": "tag_end",
-                    "source_offset": visible_count + len(node.get_text()),
-                },
-            ]
+        start_marker = {
+            "token": start,
+            "html": f"<{name}{attrs}>",
+            "kind": "tag_start",
+            "source_offset": visible_count,
+        }
+        inner = "".join(walk(child, f"{path}.{index}") for index, child in enumerate(node.children))
+        markers.insert(insertion_index, start_marker)
+        markers.append(
+            {
+                "token": end,
+                "html": f"</{name}>",
+                "kind": "tag_end",
+                "source_offset": visible_count,
+            }
         )
         return f"{start}{inner}{end}"
 

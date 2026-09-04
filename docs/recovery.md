@@ -23,5 +23,5 @@ Worker 内存，因此正常暂停、关闭界面或 Worker 意外退出都不�
 
 ## 不可恢复内容
 
-DeepSeek API Key 在 Windows 凭据管理器或环境变量中，不在工作区备份内。Wenyi 只读迁移也
-不会复制 API Key。恢复到另一台机器后需要重新配置凭据和 Calibre 路径。
+模型 API Key 在 Windows 凭据管理器或环境变量中，不在工作区备份内。Wenyi 只读迁移也
+不会复制 API Key。恢复到另一台机器后需要重新配置凭据，以及 KindleUnpack 或可选 Calibre。

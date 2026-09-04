@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ...domain.models import ParsedBook
 from ...errors import FolioCrossError
-from .calibre import is_convertible
+from .conversion import is_kindle_format
 from .docx import parse_docx
 from .epub import parse_epub
 from .fb2 import parse_fb2
@@ -29,8 +29,10 @@ def parse_book(path: str, source_lang: str = "auto") -> ParsedBook:
             return parse_text(path, source_lang)
         if suffix == ".docx":
             return parse_docx(path, source_lang)
-        if is_convertible(path):
-            raise FolioCrossError("conversion_required", "该格式需要先通过 Calibre 转换为 EPUB。")
+        if is_kindle_format(path):
+            raise FolioCrossError(
+                "conversion_required", "该格式需要先通过 KindleUnpack 或 Calibre 转换为 EPUB。"
+            )
     except FolioCrossError:
         raise
     except Exception as error:

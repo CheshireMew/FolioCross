@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import sqlite3
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ..domain.models import JobConfig, ModelProfile
 from ..errors import FolioCrossError
-from ..infrastructure.formats.calibre import is_convertible
+from ..infrastructure.formats.conversion import is_kindle_format
+from ..infrastructure.formats.markers import MARKER_PATTERN
 from ..infrastructure.repository import sha256_file, utc_now
 from .service import FolioCrossService
 
@@ -34,6 +37,12 @@ def discover_wenyi_states(wenyi_root: str) -> list[dict[str, Any]]:
                 "source_sha256": manifest.get("source_sha256", ""),
                 "chapters": len(manifest.get("chapters") or []),
                 "needs_source": True,
+                "supported": str(manifest.get("fmt", "")).lower() not in {"pdf", "srt"},
+                "skip_reason": (
+                    "FolioCross 首版不迁移 PDF 或 SRT 任务"
+                    if str(manifest.get("fmt", "")).lower() in {"pdf", "srt"}
+                    else ""
+                ),
             }
         )
     return result
@@ -61,6 +70,132 @@ def _locked(path: Path) -> bool:
         stream.close()
 
 
+def _normalized_source(text: str) -> str:
+    visible = MARKER_PATTERN.sub("", str(text)).replace("\xa0", " ")
+    return re.sub(r"\s+", " ", visible).strip()
+
+
+def _resource_name(value: str) -> str:
+    return PurePosixPath(str(value).replace("\\", "/")).name
+
+
+def _legacy_segments(old_state: Path, manifest: dict[str, Any]) -> dict[str, list[dict]]:
+    by_resource: dict[str, list[dict]] = {}
+    for chapter_entry in manifest.get("chapters") or []:
+        index = int(chapter_entry.get("index", 0))
+        chapter_path = old_state / "chapters" / f"ch{index}.json"
+        if not chapter_path.is_file():
+            continue
+        chapter = json.loads(chapter_path.read_text(encoding="utf-8"))
+        for segment in chapter.get("segments") or []:
+            source = _normalized_source(segment.get("source", ""))
+            if not source:
+                continue
+            resource = _resource_name(
+                segment.get("resource_href") or chapter_entry.get("href") or ""
+            )
+            by_resource.setdefault(resource, []).append({**segment, "normalized_source": source})
+    return by_resource
+
+
+def map_wenyi_segments(
+    old_state: Path, manifest: dict[str, Any], new_segments: list[dict[str, Any]]
+) -> tuple[list[tuple[dict[str, Any], list[dict[str, Any]]]], list[dict[str, Any]]]:
+    """Align Wenyi split segments to current template blocks by resource and source stream."""
+
+    legacy = _legacy_segments(old_state, manifest)
+    cursors = {resource: 0 for resource in legacy}
+    mappings: list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    problems: list[dict[str, Any]] = []
+    for segment in new_segments:
+        resource = _resource_name(segment.get("locator", {}).get("resource", ""))
+        target_source = _normalized_source(segment.get("source_text", ""))
+        legacy_resource = resource
+        if legacy_resource not in legacy and "" in legacy:
+            legacy_resource = ""
+        old_rows = legacy.get(legacy_resource, [])
+        start = cursors.get(legacy_resource, 0)
+        matched: list[dict[str, Any]] | None = None
+        # Wenyi may have split a long template block into several continuation
+        # segments. Its writer concatenates those pieces without a separator.
+        for end in range(start, min(len(old_rows), start + 100)):
+            source_parts = [row["normalized_source"] for row in old_rows[start : end + 1]]
+            candidates = {"".join(source_parts), " ".join(source_parts)}
+            if target_source in candidates:
+                matched = old_rows[start : end + 1]
+                cursors[legacy_resource] = end + 1
+                break
+            if min(len(candidate) for candidate in candidates) > len(target_source):
+                break
+        if matched is None:
+            problems.append(
+                {
+                    "kind": "unmatched_current_segment",
+                    "resource": resource,
+                    "source": target_source[:240],
+                    "legacy_cursor": start,
+                }
+            )
+            continue
+        mappings.append((segment, matched))
+
+    for resource, rows in legacy.items():
+        cursor = cursors.get(resource, 0)
+        if cursor < len(rows):
+            problems.append(
+                {
+                    "kind": "unconsumed_legacy_segments",
+                    "resource": resource,
+                    "count": len(rows) - cursor,
+                    "first_source": rows[cursor]["normalized_source"][:240],
+                }
+            )
+    return mappings, problems
+
+
+def _joined_translation(rows: list[dict[str, Any]], key: str) -> str:
+    values = [row.get(key) for row in rows]
+    if not values or not all(isinstance(value, str) and value.strip() for value in values):
+        return ""
+    return "".join(str(value) for value in values)
+
+
+def _copy_legacy_outputs(
+    service: FolioCrossService, source: Path, book_id: str, job_id: str
+) -> list[dict[str, str]]:
+    output_dir = source.parent / "output"
+    if not output_dir.is_dir():
+        return []
+    prefix = f"{source.stem}.zh".casefold()
+    supported = {".epub", ".docx", ".html", ".htm", ".txt", ".md", ".markdown"}
+    copied: list[dict[str, str]] = []
+    destination_dir = service.workspace.book_export_dir(book_id) / "wenyi-import"
+    for candidate in sorted(output_dir.iterdir(), key=lambda item: item.name.casefold()):
+        if (
+            not candidate.is_file()
+            or candidate.suffix.casefold() not in supported
+            or not candidate.stem.casefold().startswith(prefix)
+        ):
+            continue
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / candidate.name
+        if destination.is_file() and sha256_file(destination) != sha256_file(candidate):
+            destination = destination.with_name(
+                f"{destination.stem}-{sha256_file(candidate)[:8]}{destination.suffix}"
+            )
+        if not destination.is_file():
+            shutil.copy2(candidate, destination)
+        service.repository.add_artifact(
+            job_id,
+            kind="translation",
+            format_name=destination.suffix.lstrip("."),
+            path=str(destination),
+            metadata={"source": "wenyi-v0.5.2", "legacy_path": str(candidate)},
+        )
+        copied.append({"source": str(candidate), "copied_to": str(destination)})
+    return copied
+
+
 def migrate_wenyi_state(
     service: FolioCrossService,
     *,
@@ -85,8 +220,23 @@ def migrate_wenyi_state(
             "选择的源书与该 Wenyi 状态不匹配。",
             details={"expected_sha256": expected_hash, "actual_sha256": actual_hash},
         )
-    if source.suffix.lower() in {".pdf", ".srt"} or manifest.get("fmt") in {"pdf", "srt"}:
-        raise FolioCrossError("wenyi_format_unsupported", "FolioCross 首版不迁移 PDF 或 SRT 任务。")
+    manifest_format = str(manifest.get("fmt", "")).lower()
+    if source.suffix.lower() in {".pdf", ".srt"} or manifest_format in {"pdf", "srt"}:
+        report = {
+            "ok": True,
+            "skipped": True,
+            "reason_code": "wenyi_format_unsupported",
+            "message": "FolioCross 首版不迁移 PDF 或 SRT 任务。",
+            "wenyi_state": str(old_state),
+            "source_sha256": actual_hash,
+            "source_modified": False,
+            "migrated_at": utc_now(),
+        }
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", old_state.name)[:80] or "task"
+        report_path = service.workspace.imports_dir / f"wenyi-skipped-{safe_name}.json"
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        report["report_path"] = str(report_path)
+        return report
     if service.repository.find_book_by_hash(actual_hash):
         raise FolioCrossError(
             "book_already_imported",
@@ -94,7 +244,7 @@ def migrate_wenyi_state(
         )
 
     working_override = None
-    if is_convertible(str(source)):
+    if is_kindle_format(str(source)):
         converted = old_state / "source" / actual_hash / "converted.epub"
         if not converted.is_file():
             raise FolioCrossError(
@@ -107,50 +257,50 @@ def migrate_wenyi_state(
     config = JobConfig(
         source_lang=str(manifest.get("source_lang", "auto")),
         target_lang="zh-CN",
+        # Preserve the original template block boundaries. Wenyi continuation
+        # segments are combined by the source-stream mapper below.
+        max_chars_per_segment=10_000_000,
         profile=profile,
     )
     imported = service.import_book(str(source), config, working_source_override=working_override)
     job_id = imported["job_id"]
     chapters = service.repository.chapters_for_job(job_id)
+    new_segments = [
+        segment
+        for chapter in chapters
+        for segment in service.repository.segments_for_chapter(chapter["id"])
+    ]
+    mappings, mapping_problems = map_wenyi_segments(old_state, manifest, new_segments)
     translated = 0
     before_polish = 0
-    for old_entry, new_chapter in zip(manifest.get("chapters") or [], chapters):
-        chapter_path = old_state / "chapters" / f"ch{int(old_entry.get('index', 0))}.json"
-        if not chapter_path.is_file():
-            continue
-        old_chapter = json.loads(chapter_path.read_text(encoding="utf-8"))
-        new_segments = service.repository.segments_for_chapter(new_chapter["id"])
-        old_segments = [
-            item for item in old_chapter.get("segments", []) if str(item.get("source", "")).strip()
-        ]
-        if len(old_segments) != len(new_segments):
-            service.repository.create_issue(
-                job_id,
-                segment_id=None,
-                category="migration",
-                severity="warning",
-                message=f"章节“{new_chapter['title']}”的段落数量不同，未自动映射正文。",
-                evidence={"wenyi": len(old_segments), "foliocross": len(new_segments)},
+    for new_segment, old_segments in mappings:
+        base = _joined_translation(old_segments, "target_before_polish")
+        final = _joined_translation(old_segments, "target") or base
+        if base:
+            service.repository.save_segment_revision(
+                new_segment["id"], base, origin="wenyi_translation", model="legacy"
             )
-            continue
-        for old_segment, new_segment in zip(old_segments, new_segments):
-            base = old_segment.get("target_before_polish")
-            target = old_segment.get("target")
-            if isinstance(base, str) and base.strip():
-                service.repository.save_segment_revision(
-                    new_segment["id"], base, origin="wenyi_translation", model="legacy"
-                )
-                before_polish += 1
-            if isinstance(target, str) and target.strip() and target != base:
-                service.repository.save_segment_revision(
-                    new_segment["id"], target, origin="wenyi_final", model="legacy"
-                )
-                translated += 1
-            elif isinstance(base, str) and base.strip():
-                translated += 1
+            before_polish += 1
+        if final and final != base:
+            service.repository.save_segment_revision(
+                new_segment["id"], final, origin="wenyi_final", model="legacy"
+            )
+        if final:
+            translated += 1
+
+    for problem in mapping_problems:
+        service.repository.create_issue(
+            job_id,
+            segment_id=None,
+            category="migration",
+            severity="warning",
+            message="Wenyi 正文有一处无法根据资源和原文连续流自动映射。",
+            evidence=problem,
+        )
 
     glossary_path = old_state / "glossary.db"
     glossary_count = 0
+    glossary_conflicts = 0
     if glossary_path.is_file():
         connection = sqlite3.connect(f"file:{glossary_path.as_posix()}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
@@ -166,12 +316,43 @@ def migrate_wenyi_state(
                         "type": item.get("type", "term"),
                         "reading": item.get("reading", ""),
                         "confidence": item.get("confidence", 0.5) or 0.5,
+                        "first_chapter": item.get("first_chapter", 0) or 0,
                     }
                 )
             service.repository.upsert_glossary_terms(job_id, terms)
             glossary_count = len(terms)
+            conflict_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='term_conflicts'"
+            ).fetchone()
+            if conflict_table:
+                conflicts = connection.execute(
+                    """SELECT source,proposed_target,chapter FROM term_conflicts
+                    WHERE COALESCE(resolved,0)=0 ORDER BY id"""
+                ).fetchall()
+                for conflict in conflicts:
+                    if service.repository.record_glossary_conflict(
+                        job_id,
+                        str(conflict["source"]),
+                        str(conflict["proposed_target"] or ""),
+                        chapter_index=int(conflict["chapter"] or 0),
+                    ):
+                        glossary_conflicts += 1
         finally:
             connection.close()
+
+    analysis_path = old_state / "analysis.json"
+    analysis: dict[str, Any] = {}
+    if analysis_path.is_file():
+        loaded_analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+        if isinstance(loaded_analysis, dict):
+            analysis = loaded_analysis
+            service.repository.update_book_context(job_id, analysis)
+            for chapter in chapters:
+                service.repository.update_chapter_summary(
+                    chapter["id"], "从 Wenyi v0.5.2 状态导入；旧状态未单独保存本章梗概。"
+                )
+    if glossary_count:
+        service.repository.freeze_glossary(job_id)
 
     usage_path = old_state / "usage.json"
     usage = {}
@@ -202,6 +383,13 @@ def migrate_wenyi_state(
     service.repository.update_job(
         job_id, status="paused", stage="migrated", message="Wenyi 状态已只读导入，请检查后恢复"
     )
+    legacy_outputs = _copy_legacy_outputs(service, source, imported["book_id"], job_id)
+    source_hash_after = sha256_file(source)
+    if source_hash_after != actual_hash:
+        raise FolioCrossError(
+            "wenyi_source_modified",
+            "迁移后源文件校验值发生变化，已停止并保留迁移报告所需状态。",
+        )
     report = {
         "ok": True,
         "migrated_at": utc_now(),
@@ -211,11 +399,23 @@ def migrate_wenyi_state(
         "book_id": imported["book_id"],
         "job_id": job_id,
         "translated_segments": translated,
+        "mapped_segments": len(mappings),
+        "mapping_problems": mapping_problems,
         "pre_polish_revisions": before_polish,
         "glossary_terms": glossary_count,
+        "glossary_conflicts": glossary_conflicts,
+        "book_context_imported": bool(analysis),
         "legacy_usage_present": bool(usage),
-        "source_modified": False,
+        "legacy_outputs": legacy_outputs,
+        "source_modified": source_hash_after != actual_hash,
     }
     report_path = service.workspace.imports_dir / f"wenyi-{job_id}.json"
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    service.repository.add_artifact(
+        job_id,
+        kind="migration_report",
+        format_name="json",
+        path=str(report_path),
+        metadata={"source": "wenyi-v0.5.2", "read_only": True},
+    )
     return report

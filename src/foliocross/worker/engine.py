@@ -98,6 +98,7 @@ class RequestGate:
                 token_ok = (
                     self.tpm is None
                     or sum(item[1] for item in self.tokens) + estimated_tokens <= self.tpm
+                    or not self.tokens
                 )
                 if request_ok and token_ok:
                     self.requests.append(now)
@@ -140,11 +141,19 @@ def job_lock(workspace: Workspace, job_id: str) -> Iterator[None]:
     lock_dir = workspace.jobs_dir / job_id
     lock_dir.mkdir(parents=True, exist_ok=True)
     path = lock_dir / "worker.lock"
-    stream = path.open("a+b")
-    stream.seek(0)
-    if stream.tell() == 0:
-        stream.write(b"0")
-        stream.flush()
+    try:
+        stream = path.open("a+b")
+    except OSError as error:
+        raise FolioCrossError("job_already_running", "该任务已经由另一个 Worker 运行。") from error
+    try:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"0")
+            stream.flush()
+    except OSError as error:
+        stream.close()
+        raise FolioCrossError("job_already_running", "该任务已经由另一个 Worker 运行。") from error
+    acquired = False
     try:
         if os.name == "nt":
             import msvcrt
@@ -156,6 +165,7 @@ def job_lock(workspace: Workspace, job_id: str) -> Iterator[None]:
                 raise FolioCrossError(
                     "job_already_running", "该任务已经由另一个 Worker 运行。"
                 ) from error
+            acquired = True
         else:  # pragma: no cover
             import fcntl
 
@@ -165,15 +175,16 @@ def job_lock(workspace: Workspace, job_id: str) -> Iterator[None]:
                 raise FolioCrossError(
                     "job_already_running", "该任务已经由另一个 Worker 运行。"
                 ) from error
+            acquired = True
         yield
     finally:
         try:
-            if os.name == "nt":
+            if acquired and os.name == "nt":
                 import msvcrt
 
                 stream.seek(0)
                 msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:  # pragma: no cover
+            elif acquired:  # pragma: no cover
                 import fcntl
 
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
@@ -418,16 +429,44 @@ class WorkerEngine:
                 self._prepare(job_id, runtime)
                 self._translate(job_id, runtime)
                 self._quality(job_id, runtime)
-                output = self._export(job_id, config) if export_when_done else None
+                unresolved_errors = self.repository.unresolved_error_count(job_id)
+                should_export = export_when_done and unresolved_errors == 0
+                if export_when_done and unresolved_errors:
+                    self.emitter.emit(
+                        job_id,
+                        "warning.raised",
+                        {
+                            "code": "unresolved_quality_errors",
+                            "count": unresolved_errors,
+                            "message": "存在未解决的严重质量问题，请确认后手动导出。",
+                        },
+                    )
+                output = self._export(job_id, config) if should_export else None
+                final_status = (
+                    JobStatus.COMPLETED.value
+                    if should_export or job["status"] == JobStatus.COMPLETED.value
+                    else JobStatus.READY.value
+                )
                 self.repository.update_job(
                     job_id,
-                    status=JobStatus.COMPLETED.value if export_when_done else JobStatus.READY.value,
-                    stage="completed" if export_when_done else "ready",
-                    message="翻译与导出完成" if export_when_done else "翻译完成，可以导出",
-                    finished=export_when_done,
+                    status=final_status,
+                    stage="completed" if final_status == JobStatus.COMPLETED.value else "ready",
+                    message=(
+                        "翻译与导出完成"
+                        if final_status == JobStatus.COMPLETED.value
+                        else (
+                            f"发现 {unresolved_errors} 个严重问题，确认后仍可手动导出"
+                            if unresolved_errors
+                            else "翻译完成，可以导出"
+                        )
+                    ),
+                    finished=should_export,
                 )
-                self.emitter.emit(job_id, "job.completed", {"output": output})
-                return {"ok": True, "job_id": job_id, "status": "completed", "output": output}
+                event_type = (
+                    "job.completed" if final_status == JobStatus.COMPLETED.value else "job.ready"
+                )
+                self.emitter.emit(job_id, event_type, {"output": output})
+                return {"ok": True, "job_id": job_id, "status": final_status, "output": output}
             except PauseRequested:
                 self.repository.update_job(
                     job_id, status=JobStatus.PAUSED.value, message="已在安全检查点暂停"
@@ -704,6 +743,8 @@ class WorkerEngine:
         chapters = self.repository.chapters_for_job(job_id)
         missing = [chapter for chapter in chapters if not chapter["summary"]]
         if not missing and self.repository.get_job(job_id).get("book_context"):
+            if not self.repository.glossary_snapshot(job_id)["version"]:
+                self.repository.freeze_glossary(job_id)
             return
         self.repository.update_job(
             job_id,
@@ -789,6 +830,7 @@ class WorkerEngine:
             max_tokens=1600,
         )
         self.repository.update_book_context(job_id, overview)
+        self.repository.freeze_glossary(job_id)
         self.repository.update_step(
             job_id,
             "prepare",
@@ -804,6 +846,21 @@ class WorkerEngine:
         total = self.repository.get_job(job_id)["total_segments"]
         if not chapters:
             return
+        if len(chapters) == 1:
+            remaining = self.repository.segments_for_chapter(chapters[0]["id"])
+            remaining_chars = sum(
+                len(segment["source_text"]) for segment in remaining if not segment["target_text"]
+            )
+            if remaining_chars > runtime.config.max_chars_per_batch:
+                self.emitter.emit(
+                    job_id,
+                    "warning.raised",
+                    {
+                        "code": "single_chapter_bottleneck",
+                        "message": "当前只剩一个长章节；同章必须顺序翻译，跨章并发暂时无法提速。",
+                        "remaining_characters": remaining_chars,
+                    },
+                )
         self.repository.update_job(
             job_id, status=JobStatus.TRANSLATING.value, stage="translate", message="正在翻译正文"
         )
@@ -853,9 +910,10 @@ class WorkerEngine:
             pending = [item for item in batch if not item["target_text"]]
             if not pending:
                 continue
+            current_segments = self.repository.segments_for_chapter(chapter["id"])
             previous = [
                 item["target_text"]
-                for item in segments
+                for item in current_segments
                 if item["segment_index"] < pending[0]["segment_index"] and item["target_text"]
             ]
             previous = previous[-runtime.config.rolling_context_segments :]
@@ -892,6 +950,10 @@ class WorkerEngine:
                         category=issue["category"],
                         severity=issue["severity"],
                         message=issue["message"],
+                        evidence={
+                            "source": segment["source_text"][:800],
+                            "target": target[:800],
+                        },
                     )
 
     @staticmethod

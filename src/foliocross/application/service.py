@@ -13,8 +13,14 @@ from typing import Any
 from ..domain.models import DesiredState, JobConfig, ModelProfile
 from ..errors import FolioCrossError
 from ..infrastructure.credentials import CredentialStore
-from ..infrastructure.formats.calibre import convert_to_epub, find_ebook_convert, is_convertible
+from ..infrastructure.formats.calibre import find_ebook_convert
 from ..infrastructure.formats.common import split_long_segments
+from ..infrastructure.formats.conversion import (
+    convert_kindle_to_epub,
+    find_kindleunpack_python,
+    is_kindle_format,
+)
+from ..infrastructure.formats.covers import extract_cover
 from ..infrastructure.formats.exporters import export_job
 from ..infrastructure.formats.registry import parse_book
 from ..infrastructure.llm import OpenAICompatibleClient, parse_json_content
@@ -48,6 +54,17 @@ class FolioCrossService:
         data = {
             "provider": provider,
             "base_url": str(values.get("base_url", current.base_url)).strip().rstrip("/"),
+            "api_key_env": str(
+                values.get(
+                    "api_key_env",
+                    {
+                        "deepseek": "DEEPSEEK_API_KEY",
+                        "openai": "OPENAI_API_KEY",
+                        "ollama": "",
+                        "vllm": "",
+                    }[provider],
+                )
+            ).strip(),
             "translation_model": str(values.get("model", current.translation_model)).strip(),
             "analysis_model": str(values.get("model", current.analysis_model)).strip(),
             "repair_model": str(values.get("model", current.repair_model)).strip(),
@@ -59,10 +76,14 @@ class FolioCrossService:
             "price_effective_date": str(
                 values.get("effective_date", current.price_effective_date or "")
             ).strip(),
-            "price_source": current.price_source,
-            "peak_multiplier": current.peak_multiplier,
-            "peak_weekdays_utc": current.peak_weekdays_utc,
-            "peak_windows_utc": current.peak_windows_utc,
+            "price_source": (
+                str(values.get("price_source", current.price_source or "")).strip() or None
+                if provider == "deepseek"
+                else None
+            ),
+            "peak_multiplier": current.peak_multiplier if provider == "deepseek" else 1.0,
+            "peak_weekdays_utc": current.peak_weekdays_utc if provider == "deepseek" else [],
+            "peak_windows_utc": current.peak_windows_utc if provider == "deepseek" else [],
         }
         if not data["base_url"] or not data["translation_model"]:
             raise FolioCrossError("invalid_model_profile", "模型名称和接口地址都不能为空。")
@@ -79,6 +100,28 @@ class FolioCrossService:
         working_source_override: str | None = None,
     ) -> dict[str, Any]:
         config = config or self.default_job_config()
+        output = config.output_format.lower()
+        if output not in {"epub", "docx", "html", "txt", "md", "markdown"}:
+            raise FolioCrossError("unsupported_output", f"不支持的输出格式：{config.output_format}")
+        config.output_format = "md" if output == "markdown" else output
+        if config.profile.provider not in {"deepseek", "openai", "ollama", "vllm", "fake"}:
+            raise FolioCrossError(
+                "invalid_provider", f"不支持的模型服务类型：{config.profile.provider}"
+            )
+        if config.soft_budget is not None and config.soft_budget <= 0:
+            raise FolioCrossError("invalid_budget", "费用提醒值必须大于 0。")
+        if config.hard_budget is not None and config.hard_budget < 0:
+            raise FolioCrossError("invalid_budget", "费用上限不能为负数。")
+        if (
+            config.soft_budget is not None
+            and config.hard_budget is not None
+            and config.soft_budget > config.hard_budget
+        ):
+            raise FolioCrossError("invalid_budget", "费用提醒值不能高于硬预算上限。")
+        config.translation_max_concurrency = max(1, min(4, int(config.translation_max_concurrency)))
+        config.translation_start_concurrency = min(
+            config.translation_start_concurrency, config.translation_max_concurrency
+        )
         source = Path(path).resolve()
         if not source.is_file():
             raise FolioCrossError("file_not_found", f"找不到文件：{source}")
@@ -108,6 +151,7 @@ class FolioCrossService:
             shutil.copy2(source, stored_source)
         working_source = Path(existing["working_source_path"]) if existing else stored_source
         original_format = source.suffix.lower().lstrip(".")
+        conversion_info: dict[str, Any] | None = None
         if working_source_override:
             override = Path(working_source_override).resolve()
             if not override.is_file():
@@ -116,12 +160,25 @@ class FolioCrossService:
             working_source.parent.mkdir(parents=True, exist_ok=True)
             if not working_source.is_file():
                 shutil.copy2(override, working_source)
-        elif is_convertible(str(source)):
+        elif is_kindle_format(str(source)):
             calibre_path = self.repository.get_setting("calibre_path")
+            kindleunpack_python = self.repository.get_setting("kindleunpack_python")
             working_source = source_dir / "normalized" / f"{source_hash}.epub"
-            convert_to_epub(str(stored_source), str(working_source), executable=calibre_path)
+            converted = convert_kindle_to_epub(
+                str(stored_source),
+                str(working_source),
+                kindleunpack_python=kindleunpack_python,
+                calibre_executable=calibre_path,
+            )
+            conversion_info = {
+                "backend": converted.backend,
+                "backend_path": converted.backend_path,
+                "fallback_attempts": converted.attempts,
+            }
         parsed = parse_book(str(working_source), config.source_lang)
         parsed.source_format = original_format
+        if conversion_info:
+            parsed.metadata["source_conversion"] = conversion_info
         parsed = split_long_segments(parsed, config.max_chars_per_segment)
         job_id = new_id()
         actual_book_id, job_id = self.repository.create_book_and_job(
@@ -135,6 +192,33 @@ class FolioCrossService:
             config=config,
         )
         job = self.repository.get_job(job_id)
+        self.repository.add_artifact(
+            job_id,
+            kind="source",
+            format_name=original_format,
+            path=str(stored_source),
+            metadata={"sha256": source_hash},
+        )
+        if Path(working_source) != Path(stored_source):
+            self.repository.add_artifact(
+                job_id,
+                kind="normalized_source",
+                format_name=Path(working_source).suffix.lstrip("."),
+                path=str(working_source),
+                metadata=conversion_info or {"source": "migration_override"},
+            )
+        cover = extract_cover(
+            str(working_source),
+            Path(working_source).suffix.lower().lstrip("."),
+            self.workspace.job_artifact_dir(job_id),
+        )
+        if cover:
+            self.repository.add_artifact(
+                job_id,
+                kind="cover",
+                format_name=Path(cover).suffix.lstrip("."),
+                path=cover,
+            )
         return {
             "ok": True,
             "book_id": actual_book_id,
@@ -201,6 +285,9 @@ class FolioCrossService:
         apply_existing: bool = False,
     ) -> dict[str, Any]:
         result = self.repository.update_glossary_term(job_id, source, target)
+        snapshot = self.repository.glossary_snapshot(job_id)
+        result["snapshot_stale"] = bool(snapshot["version"])
+        result["snapshot_version"] = snapshot["version"]
         result["applied_segments"] = 0
         previous = result["previous_target"]
         if not apply_existing or not previous or previous == target:
@@ -222,13 +309,31 @@ class FolioCrossService:
             result["applied_segments"] += 1
         return {"ok": True, **result}
 
-    def apply_issue_suggestion(self, issue_id: str) -> dict[str, Any]:
+    def refresh_glossary_snapshot(self, job_id: str) -> dict[str, Any]:
+        job = self.repository.get_job(job_id)
+        if job["status"] in {"preparing", "translating", "quality_check", "exporting"}:
+            raise FolioCrossError(
+                "job_is_running", "任务运行期间不能更换已冻结的术语版本，请先安全暂停。"
+            )
+        snapshot = self.repository.freeze_glossary(job_id)
+        return {"ok": True, **snapshot}
+
+    def apply_issue_suggestion(
+        self, issue_id: str, edited_suggestion: str | None = None
+    ) -> dict[str, Any]:
         issue = self.repository.issue(issue_id)
-        if not issue["segment_id"] or not str(issue["suggestion"]).strip():
+        suggestion = (
+            edited_suggestion.strip()
+            if edited_suggestion is not None
+            else str(issue["suggestion"]).strip()
+        )
+        if not issue["segment_id"] or not suggestion:
             raise FolioCrossError("issue_has_no_suggestion", "这个问题没有可直接应用的修改建议。")
+        if suggestion != issue["suggestion"]:
+            self.repository.update_issue_suggestion(issue_id, suggestion)
         version = self.repository.save_segment_revision(
             issue["segment_id"],
-            issue["suggestion"],
+            suggestion,
             origin="review_accept",
             instruction=issue["message"],
             lock=True,
@@ -308,6 +413,9 @@ class FolioCrossService:
         bilingual: bool,
         soft_budget: float | None,
         hard_budget: float | None,
+        max_concurrency: int = 4,
+        requests_per_minute: int | None = None,
+        tokens_per_minute: int | None = None,
     ) -> dict[str, Any]:
         output = output_format.lower()
         if output not in {"epub", "docx", "html", "txt", "md", "markdown"}:
@@ -320,6 +428,12 @@ class FolioCrossService:
         config.bilingual = bilingual
         config.soft_budget = soft_budget
         config.hard_budget = hard_budget
+        config.translation_max_concurrency = max(1, min(4, int(max_concurrency)))
+        config.translation_start_concurrency = min(
+            config.translation_start_concurrency, config.translation_max_concurrency
+        )
+        config.requests_per_minute = requests_per_minute
+        config.tokens_per_minute = tokens_per_minute
         self.repository.update_job_config(job_id, config)
         return {"ok": True, "job_id": job_id, "config": config.to_dict()}
 
@@ -344,16 +458,35 @@ class FolioCrossService:
             calibre = find_ebook_convert(configured_calibre)
         except FolioCrossError:
             calibre = None
-        key_available = bool(self.credentials.get("deepseek-default", "DEEPSEEK_API_KEY"))
+        configured_kindleunpack = self.repository.get_setting("kindleunpack_python")
+        try:
+            kindleunpack = find_kindleunpack_python(configured_kindleunpack)
+        except FolioCrossError:
+            kindleunpack = None
+        profile = self.default_job_config().profile
+        key_available = bool(self.credentials.get(profile.id, profile.api_key_env))
         return {
             "ok": all(dependencies.values()),
             "workspace": str(self.workspace.root),
             "database": str(self.workspace.db_path),
             "dependencies": dependencies,
+            "kindleunpack": {"available": bool(kindleunpack), "path": kindleunpack},
             "calibre": {"available": bool(calibre), "path": calibre},
+            "kindle_conversion": {
+                "available": bool(kindleunpack or calibre),
+                "preferred_backend": (
+                    "kindleunpack" if kindleunpack else ("calibre" if calibre else None)
+                ),
+                "calibre_optional": True,
+            },
+            "model_api_key": {
+                "available": key_available,
+                "provider": profile.provider,
+                "source": "credential-or-environment",
+            },
             "deepseek_api_key": {"available": key_available, "source": "credential-or-environment"},
             "platform": os.name,
-            "model_profile": asdict(self.default_job_config().profile),
+            "model_profile": asdict(profile),
             "active_task_limit": int(self.repository.get_setting("active_task_limit", 1) or 1),
         }
 

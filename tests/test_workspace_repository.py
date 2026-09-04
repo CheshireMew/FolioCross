@@ -32,7 +32,7 @@ def test_workspace_schema_and_wal(workspace):
     with workspace.connect() as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         versions = [row[0] for row in connection.execute("SELECT version FROM schema_migrations")]
-    assert versions == [1, 2, 3]
+    assert versions == [1, 2, 3, 4]
 
 
 def test_import_creates_uuid_book_job_and_segments(workspace, tmp_path: Path):
@@ -46,6 +46,9 @@ def test_import_creates_uuid_book_job_and_segments(workspace, tmp_path: Path):
     assert job["title"] == "Chapter 1"
     assert job["status"] == "paused"
     assert job["total_segments"] == 3
+    assert job["source_characters"] == len(
+        "Chapter 1A complete first paragraph.A complete second paragraph."
+    )
     assert Path(job["stored_source_path"]).is_file()
     assert result["book_id"] != result["job_id"]
 
@@ -59,6 +62,23 @@ def test_same_source_reopens_the_existing_content_addressed_job(workspace, tmp_p
     assert one["book_id"] == two["book_id"]
     assert one["job_id"] == two["job_id"]
     assert two["reused"] is True
+
+
+def test_same_title_and_replaced_source_path_create_distinct_books(workspace, tmp_path: Path):
+    source = tmp_path / "same-title.txt"
+    service = FolioCrossService(workspace)
+    source.write_text("First edition.", encoding="utf-8")
+    first = service.import_book(str(source), fake_config())
+    source.write_text("Second edition with different content.", encoding="utf-8")
+    second = service.import_book(str(source), fake_config())
+    assert first["book_id"] != second["book_id"]
+    assert first["job_id"] != second["job_id"]
+    assert (
+        Path(service.repository.get_job(first["job_id"])["stored_source_path"]).read_text(
+            encoding="utf-8"
+        )
+        == "First edition."
+    )
 
 
 def test_manual_revision_locks_segment_and_uses_optimistic_version(workspace, tmp_path: Path):
@@ -92,6 +112,10 @@ def test_glossary_conflict_and_affected_segments(workspace, tmp_path: Path):
     assert "艾丽斯" in term["alternatives"]
     updated = service.repository.update_glossary_term(job_id, "Alice", "爱丽丝")
     assert updated["affected_segments"] == 1
+    affected = service.repository.affected_segments(job_id, "Alice")
+    assert len(affected) == 1
+    assert affected[0]["chapter_title"]
+    assert affected[0]["source_text"] == "Alice meets Alice."
 
 
 def test_glossary_choice_is_deterministic_across_concurrent_scan_order(workspace, tmp_path: Path):
@@ -188,6 +212,9 @@ def test_model_and_job_configuration_are_persisted_as_snapshots(workspace, tmp_p
     )
     assert saved["provider"] == "ollama"
     assert saved["input_price_per_million"] is None
+    assert saved["peak_multiplier"] == 1.0
+    assert saved["peak_windows_utc"] == []
+    assert saved["price_source"] is None
     source = tmp_path / "configured.txt"
     source.write_text("A configurable paragraph.", encoding="utf-8")
     job_id = service.import_book(str(source))["job_id"]

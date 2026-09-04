@@ -253,7 +253,9 @@ class Repository:
         where = "" if include_archived else "WHERE j.archived=0"
         with self.workspace.session() as connection:
             rows = connection.execute(
-                f"""SELECT j.*, b.title, b.author, b.source_format
+                f"""SELECT j.*, b.title, b.author, b.source_format,
+                    (SELECT COALESCE(SUM(LENGTH(s.source_text)),0) FROM segments s
+                     JOIN chapters c ON c.id=s.chapter_id WHERE c.book_id=j.book_id) source_characters
                     FROM jobs j JOIN books b ON b.id=j.book_id
                     {where} ORDER BY j.updated_at DESC"""
             ).fetchall()
@@ -272,7 +274,9 @@ class Repository:
         with self.workspace.session() as connection:
             row = connection.execute(
                 """SELECT j.*, b.title, b.author, b.source_format, b.stored_source_path,
-                    b.working_source_path, b.metadata_json, b.warnings_json
+                    b.working_source_path, b.metadata_json, b.warnings_json,
+                    (SELECT COALESCE(SUM(LENGTH(s.source_text)),0) FROM segments s
+                     JOIN chapters c ON c.id=s.chapter_id WHERE c.book_id=j.book_id) source_characters
                     FROM jobs j JOIN books b ON b.id=j.book_id WHERE j.id=?""",
                 (job_id,),
             ).fetchone()
@@ -299,7 +303,9 @@ class Repository:
         with self.workspace.session() as connection:
             row = connection.execute(
                 f"""SELECT j.*,b.title,b.author,b.source_format,b.stored_source_path,
-                    b.working_source_path,b.metadata_json,b.warnings_json
+                    b.working_source_path,b.metadata_json,b.warnings_json,
+                    (SELECT COALESCE(SUM(LENGTH(s.source_text)),0) FROM segments s
+                     JOIN chapters c ON c.id=s.chapter_id WHERE c.book_id=j.book_id) source_characters
                     FROM jobs j JOIN books b ON b.id=j.book_id
                     WHERE j.book_id=? {archived} ORDER BY j.created_at DESC LIMIT 1""",
                 (book_id,),
@@ -703,6 +709,100 @@ class Repository:
             result.append(item)
         return result
 
+    def record_glossary_conflict(
+        self,
+        job_id: str,
+        source: str,
+        proposed_target: str,
+        *,
+        chapter_index: int = 0,
+    ) -> bool:
+        """Preserve a legacy alternative without changing the selected translation."""
+
+        if not source.strip() or not proposed_target.strip():
+            return False
+        now = utc_now()
+        with self.workspace.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM glossary_terms WHERE job_id=? AND source=?", (job_id, source)
+            ).fetchone()
+            if not row or row["target"] == proposed_target:
+                return False
+            alternatives = decode_json(row["alternatives_json"], [])
+            if proposed_target not in alternatives:
+                alternatives.append(proposed_target)
+            connection.execute(
+                """INSERT INTO glossary_candidates(
+                    job_id,source,target,term_type,reading,frequency,confidence,first_chapter
+                ) VALUES (?,?,?,?,?,?,?,?)
+                ON CONFLICT(job_id,source,target) DO NOTHING""",
+                (
+                    job_id,
+                    source,
+                    proposed_target,
+                    row["term_type"],
+                    row["reading"],
+                    1,
+                    row["confidence"],
+                    max(0, int(chapter_index)),
+                ),
+            )
+            connection.execute(
+                """UPDATE glossary_terms SET status='conflict',alternatives_json=?,
+                    version=version+1,updated_at=? WHERE id=?""",
+                (json_text(alternatives), now, row["id"]),
+            )
+        return True
+
+    def freeze_glossary(self, job_id: str) -> dict[str, Any]:
+        terms = self.list_glossary(job_id)
+        snapshot = [
+            {
+                "source": term["source"],
+                "target": term["target"],
+                "term_type": term["term_type"],
+                "status": term["status"],
+                "term_version": int(term["version"]),
+            }
+            for term in terms
+            if term["status"] != "rejected"
+        ]
+        now = utc_now()
+        with self.workspace.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT glossary_snapshot_version FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if not row:
+                raise FolioCrossError("job_not_found", f"找不到任务：{job_id}")
+            version = int(row["glossary_snapshot_version"]) + 1
+            connection.execute(
+                """UPDATE jobs SET glossary_snapshot_json=?,glossary_snapshot_version=?,
+                    glossary_snapshot_at=?,updated_at=? WHERE id=?""",
+                (json_text(snapshot), version, now, now, job_id),
+            )
+            self._insert_event(
+                connection,
+                job_id,
+                "glossary.frozen",
+                {"version": version, "terms": len(snapshot)},
+            )
+        return {"version": version, "terms": snapshot, "frozen_at": now}
+
+    def glossary_snapshot(self, job_id: str) -> dict[str, Any]:
+        with self.workspace.session() as connection:
+            row = connection.execute(
+                """SELECT glossary_snapshot_json,glossary_snapshot_version,
+                    glossary_snapshot_at FROM jobs WHERE id=?""",
+                (job_id,),
+            ).fetchone()
+        if not row:
+            raise FolioCrossError("job_not_found", f"找不到任务：{job_id}")
+        return {
+            "version": int(row["glossary_snapshot_version"]),
+            "terms": decode_json(row["glossary_snapshot_json"], []),
+            "frozen_at": row["glossary_snapshot_at"],
+        }
+
     def update_glossary_term(
         self, job_id: str, source: str, target: str, *, status: str = "approved"
     ) -> dict[str, Any]:
@@ -753,8 +853,24 @@ class Repository:
             ).fetchall()
         return [self._decode_segment(dict(row)) for row in rows]
 
-    def relevant_glossary(self, job_id: str, text: str) -> list[dict[str, Any]]:
-        return [term for term in self.list_glossary(job_id) if term["source"] in text]
+    def affected_segments(self, job_id: str, source: str) -> list[dict[str, Any]]:
+        with self.workspace.session() as connection:
+            rows = connection.execute(
+                """SELECT s.*,c.chapter_index,c.title chapter_title
+                    FROM segments s JOIN chapters c ON c.id=s.chapter_id
+                    JOIN jobs j ON j.book_id=c.book_id
+                    WHERE j.id=? AND instr(s.source_text,?)>0
+                    ORDER BY c.chapter_index,s.segment_index""",
+                (job_id, source),
+            ).fetchall()
+        return [self._decode_segment(dict(row)) for row in rows]
+
+    def relevant_glossary(
+        self, job_id: str, text: str, *, frozen: bool = True
+    ) -> list[dict[str, Any]]:
+        snapshot = self.glossary_snapshot(job_id) if frozen else {"version": 0, "terms": []}
+        terms = snapshot["terms"] if snapshot["version"] else self.list_glossary(job_id)
+        return [term for term in terms if term["source"] in text]
 
     def create_issue(
         self,
@@ -812,6 +928,24 @@ class Repository:
             ).rowcount
             if not changed:
                 raise FolioCrossError("issue_not_found", f"找不到质量问题：{issue_id}")
+
+    def update_issue_suggestion(self, issue_id: str, suggestion: str) -> None:
+        with self.workspace.transaction(immediate=True) as connection:
+            changed = connection.execute(
+                "UPDATE review_issues SET suggestion=? WHERE id=?", (suggestion, issue_id)
+            ).rowcount
+            if not changed:
+                raise FolioCrossError("issue_not_found", f"找不到质量问题：{issue_id}")
+
+    def unresolved_error_count(self, job_id: str) -> int:
+        with self.workspace.session() as connection:
+            return int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM review_issues
+                    WHERE job_id=? AND status='open' AND severity='error'""",
+                    (job_id,),
+                ).fetchone()[0]
+            )
 
     def issue(self, issue_id: str) -> dict[str, Any]:
         with self.workspace.session() as connection:
@@ -970,9 +1104,41 @@ class Repository:
                     WHERE u.job_id=? AND r.attempt>1""",
                 (job_id,),
             ).fetchone()
+            chapters = connection.execute(
+                """SELECT r.chapter_id,COALESCE(c.chapter_index,-1) chapter_index,
+                    COALESCE(c.title,'全书任务') chapter_title,
+                    SUM(u.prompt_tokens) prompt_tokens,
+                    SUM(u.completion_tokens) completion_tokens,
+                    SUM(u.cache_hit_tokens) cache_hit_tokens,SUM(u.cost) cost,COUNT(*) calls
+                    FROM usage_events u JOIN llm_requests r ON r.id=u.request_id
+                    LEFT JOIN chapters c ON c.id=r.chapter_id
+                    WHERE u.job_id=?
+                    GROUP BY r.chapter_id,c.chapter_index,c.title
+                    ORDER BY chapter_index""",
+                (job_id,),
+            ).fetchall()
+            requests = connection.execute(
+                """SELECT r.id,r.chapter_id,c.title chapter_title,r.stage,r.model,r.status,
+                    r.attempt,r.prompt_tokens,r.completion_tokens,r.cache_hit_tokens,r.cost,
+                    r.currency,r.error_code,r.created_at,r.finished_at
+                    FROM llm_requests r LEFT JOIN chapters c ON c.id=r.chapter_id
+                    WHERE r.job_id=? ORDER BY r.created_at DESC,r.id DESC LIMIT 500""",
+                (job_id,),
+            ).fetchall()
+            current_request = connection.execute(
+                """SELECT r.id,r.chapter_id,c.title chapter_title,r.stage,r.model,r.status,
+                    r.attempt,r.created_at FROM llm_requests r
+                    LEFT JOIN chapters c ON c.id=r.chapter_id
+                    WHERE r.job_id=? AND r.status='pending'
+                    ORDER BY r.created_at DESC LIMIT 1""",
+                (job_id,),
+            ).fetchone()
         return {
             "total": dict(total),
             "by_stage_model": [dict(row) for row in stages],
+            "by_chapter": [dict(row) for row in chapters],
+            "requests": [dict(row) for row in requests],
+            "current_request": dict(current_request) if current_request else None,
             "retries": retries,
             "retry_usage": dict(retry_usage),
         }
@@ -1009,7 +1175,12 @@ class Repository:
             rows = connection.execute(
                 "SELECT * FROM artifacts WHERE job_id=? ORDER BY created_at DESC", (job_id,)
             ).fetchall()
-        return [dict(row) for row in rows]
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["metadata"] = decode_json(item.pop("metadata_json", "{}"), {})
+            result.append(item)
+        return result
 
     def set_setting(self, key: str, value: Any) -> None:
         with self.workspace.transaction(immediate=True) as connection:
@@ -1051,11 +1222,51 @@ class Repository:
     def _decode_job(item: dict[str, Any]) -> dict[str, Any]:
         item["config"] = decode_json(item.pop("config_json", "{}"), {})
         item["book_context"] = decode_json(item.pop("book_context_json", "{}"), {})
+        item["glossary_snapshot"] = decode_json(item.pop("glossary_snapshot_json", "[]"), [])
         if "metadata_json" in item:
             item["metadata"] = decode_json(item.pop("metadata_json"), {})
         if "warnings_json" in item:
             item["warnings"] = decode_json(item.pop("warnings_json"), [])
         item["archived"] = bool(item.get("archived"))
+        try:
+            config = JobConfig.from_dict(item["config"])
+            item["estimated_cost_peak"] = estimate_cost(
+                config.profile,
+                int(item.get("estimated_input_tokens") or 0),
+                int(item.get("estimated_output_tokens") or 0),
+                peak=True,
+            )
+            item["cost_configured"] = (
+                config.profile.input_price_per_million is not None
+                and config.profile.output_price_per_million is not None
+            )
+        except (TypeError, ValueError):
+            item["estimated_cost_peak"] = None
+            item["cost_configured"] = False
+        started_at = item.get("started_at")
+        finished_at = item.get("finished_at")
+        completed = int(item.get("completed_segments") or 0)
+        total = int(item.get("total_segments") or 0)
+        elapsed = 0.0
+        if started_at:
+            try:
+                started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
+                end = (
+                    datetime.fromisoformat(str(finished_at).replace("Z", "+00:00"))
+                    if finished_at
+                    else datetime.now(timezone.utc)
+                )
+                elapsed = max(0.0, (end - started).total_seconds())
+            except ValueError:
+                elapsed = 0.0
+        speed = completed / elapsed * 60 if elapsed > 0 and completed else 0.0
+        item["elapsed_seconds"] = round(elapsed, 1)
+        item["segments_per_minute"] = round(speed, 2)
+        item["eta_seconds"] = (
+            round((total - completed) / speed * 60)
+            if speed > 0 and completed < total and item.get("status") == JobStatus.TRANSLATING.value
+            else None
+        )
         return item
 
     @staticmethod

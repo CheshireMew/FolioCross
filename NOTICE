@@ -5,5 +5,10 @@ Wenyi v0.5.2 (https://github.com/BigDawnGhost/wenyi), which is distributed
 under the MIT License. FolioCross does not copy Wenyi's Git history, runtime
 state, branding, release configuration, PDF pipeline, or subtitle pipeline.
 
-Calibre is a separate GPL-licensed application. FolioCross only invokes its
-public ebook-convert command and does not bundle or import Calibre source code.
+KindleUnpack is a separate GPL-3.0-licensed application. FolioCross invokes a
+separately installed KindleUnpack environment as a child process and does not
+bundle or import its source into the FolioCross package.
+
+Calibre is a separate GPL-licensed application and an optional compatibility
+fallback. FolioCross only invokes its public ebook-convert command and does not
+bundle or import Calibre source code.

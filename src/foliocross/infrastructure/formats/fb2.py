@@ -12,6 +12,15 @@ def _local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
+def _section_content(section: ET.Element):
+    """Yield this section's content while leaving child sections to their own chapters."""
+
+    for child in section:
+        if _local(child.tag) == "section":
+            continue
+        yield from child.iter()
+
+
 def parse_fb2(path: str, source_lang: str = "auto") -> ParsedBook:
     root = ET.parse(path).getroot()
     title = Path(path).stem
@@ -29,14 +38,15 @@ def parse_fb2(path: str, source_lang: str = "auto") -> ParsedBook:
     for section in sections:
         paragraphs = []
         chapter_title = ""
+        local_nodes = list(_section_content(section))
         title_paragraphs = {
             id(child)
-            for title_node in section.iter()
+            for title_node in local_nodes
             if _local(title_node.tag) == "title"
             for child in title_node.iter()
             if _local(child.tag) == "p"
         }
-        for node in section.iter():
+        for node in local_nodes:
             name = _local(node.tag)
             text = "".join(node.itertext()).strip()
             if not text:
