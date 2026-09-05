@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 42 42" role="img" aria-labelledby="title desc">
+  <title id="title">FolioCross</title>
+  <desc id="desc">The orange F identity used by the FolioCross desktop sidebar.</desc>
+  <rect width="42" height="42" rx="12" fill="#c86a3b"/>
+  <text x="21" y="21" text-anchor="middle" dominant-baseline="central" font-family="Segoe UI, sans-serif" font-size="23" font-weight="700" fill="white">F</text>
+</svg>

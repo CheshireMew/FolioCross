@@ -12,6 +12,7 @@ from docx import Document
 
 from foliocross.application.service import FolioCrossService
 from foliocross.domain.models import JobConfig, ModelProfile
+from foliocross.infrastructure.formats.markers import strip_protected_markers, validate_markers
 from foliocross.infrastructure.llm import FakeClient, ModelResponse, ModelUsage
 from foliocross.worker.engine import (
     AdaptiveLimiter,
@@ -301,6 +302,32 @@ def test_explicit_deep_review_creates_issue_without_overwriting(
     service.apply_issue_suggestion(issue["id"], "人工编辑后的建议。")
     assert service.repository.segment(segment["id"])["target_text"] == "人工编辑后的建议。"
     assert service.repository.issue(issue["id"])["suggestion"] == "人工编辑后的建议。"
+
+
+def test_accept_review_preserves_protected_structure(workspace, tmp_path: Path):
+    service = FolioCrossService(workspace)
+    source = write_sample_epub(tmp_path / "review-markers.epub")
+    job_id = service.import_book(str(source), fake_config())["job_id"]
+    segment = next(
+        segment
+        for chapter in service.repository.chapters_for_job(job_id)
+        for segment in service.repository.segments_for_chapter(chapter["id"])
+        if segment["markers"]
+    )
+    issue_id = service.repository.create_issue(
+        job_id,
+        segment_id=segment["id"],
+        category="accuracy",
+        severity="warning",
+        message="Review translation",
+        suggestion="人工确认后的建议译文。",
+    )
+    service.apply_issue_suggestion(issue_id)
+    saved = service.repository.segment(segment["id"])
+    assert strip_protected_markers(saved["target_text"]) == "人工确认后的建议译文。"
+    assert validate_markers(saved["target_text"], saved["markers"]) == []
+    assert saved["locked"] is True
+    assert service.repository.issue(issue_id)["status"] == "accepted"
 
 
 def test_annotation_repair_uses_model_then_deterministic_fallback(workspace):

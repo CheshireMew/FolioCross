@@ -3,14 +3,110 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import zipfile
 from pathlib import Path
+
+from bs4 import BeautifulSoup
+from conftest import write_sample_epub
 
 from foliocross.application.migration import (
     discover_wenyi_states,
     map_wenyi_segments,
     migrate_wenyi_state,
 )
+from foliocross.application.migration_structure import restore_wenyi_structure
 from foliocross.application.service import FolioCrossService
+from foliocross.infrastructure.formats.epub import export_epub_template, parse_epub
+from foliocross.infrastructure.formats.markers import (
+    render_fragment,
+    serialize_block,
+    strip_protected_markers,
+    validate_markers,
+)
+
+
+def test_epub_migration_exports_inline_tags_and_notes(workspace, tmp_path: Path):
+    source = write_sample_epub(tmp_path / "legacy.epub")
+    parsed = parse_epub(str(source))
+    state = tmp_path / "legacy-state"
+    (state / "chapters").mkdir(parents=True)
+    entries = []
+    for index, chapter in enumerate(parsed.chapters):
+        entries.append({"index": index})
+        rows = [
+            {
+                "source": strip_protected_markers(segment.source_text),
+                "target": "译文" + strip_protected_markers(segment.source_text),
+                "resource_href": segment.locator["resource"],
+            }
+            for segment in chapter.segments
+        ]
+        (state / "chapters" / f"ch{index}.json").write_text(
+            json.dumps({"segments": rows}), encoding="utf-8"
+        )
+    (state / "manifest.json").write_text(
+        json.dumps(
+            {
+                "fmt": "epub",
+                "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                "chapters": entries,
+            }
+        ),
+        encoding="utf-8",
+    )
+    service = FolioCrossService(workspace)
+    report = migrate_wenyi_state(service, state_dir=str(state), source_path=str(source))
+    assert report["mapping_problems"] == []
+    rows = [
+        s
+        for ch in service.repository.chapters_for_job(report["job_id"])
+        for s in service.repository.segments_for_chapter(ch["id"])
+    ]
+    assert all(not validate_markers(s["target_text"], s["markers"]) for s in rows)
+    output = tmp_path / "migrated.epub"
+    export_epub_template(str(source), str(output), rows)
+    with zipfile.ZipFile(output) as archive:
+        soup = BeautifulSoup(archive.read("OEBPS/chapter.xhtml"), "lxml-xml")
+        assert soup.find("em") is not None
+        assert soup.find("a", href="#n1") is not None
+        assert soup.find("img", src="cover.png") is not None
+    assert report["structure_review_segments"] > 0
+
+
+def test_legacy_link_placements_restore_exact_translated_span():
+    source, markers = serialize_block(
+        BeautifulSoup(
+            '<p><span>Read <a href="#note">the note</a> now.</span></p>', "html.parser"
+        ).p,
+        identity="legacy-link",
+    )
+    target = "请阅读注释，然后继续。"
+    row = {
+        "target": target,
+        "meta": {
+            "epub_annotations": {
+                "target_digest": hashlib.sha256(target.encode()).hexdigest(),
+                "items": [{"id": "link", "raw_href": "#note"}],
+                "placements": [
+                    {"id": "link", "status": "aligned", "target_start": 3, "target_end": 5}
+                ],
+            }
+        },
+    }
+    restored, uncertain = restore_wenyi_structure(
+        {"source_text": source, "markers": markers}, [row], "target"
+    )
+    soup = BeautifulSoup(render_fragment(restored, markers), "html.parser")
+    assert soup.a.get_text() == "注释"
+    assert soup.a["href"] == "#note"
+    assert soup.span.get_text() == target
+    assert validate_markers(restored, markers) == []
+    assert uncertain == 0
+    row["target"] = "译文已改变，原定位不能复用。"
+    _, uncertain = restore_wenyi_structure(
+        {"source_text": source, "markers": markers}, [row], "target"
+    )
+    assert uncertain > 0
 
 
 def test_copy_only_wenyi_migration(workspace, tmp_path: Path):
@@ -90,6 +186,11 @@ def test_copy_only_wenyi_migration(workspace, tmp_path: Path):
     job = service.repository.get_job(result["job_id"])
     assert job["book_context"]["overview"] == "Legacy overview"
     assert job["glossary_snapshot_version"] == 1
+    steps = {step["name"]: step for step in service.repository.job_steps(result["job_id"])}
+    assert steps["prepare"]["status"] == "done"
+    assert steps["prepare"]["completed"] == steps["prepare"]["total"] == 1
+    assert steps["translate"]["status"] == "done"
+    assert steps["translate"]["completed"] == steps["translate"]["total"] == 1
     glossary = service.repository.list_glossary(result["job_id"])[0]
     assert glossary["target"] == "旧作"
     assert glossary["status"] == "conflict"

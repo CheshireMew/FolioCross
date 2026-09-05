@@ -13,59 +13,37 @@ from rich.console import Console
 from rich.table import Table
 
 from .application.migration import discover_wenyi_states, migrate_wenyi_state
-from .application.service import FolioCrossService
+from .cli_content import issues_app, revisions_app, segments_app
+from .cli_operations import operations_app, require_idle, submit
+from .cli_support import CliGroup, json_requested
+from .cli_support import emit as _print
+from .cli_support import run as _run
+from .cli_support import service as _service
 from .domain.models import JobConfig, ModelProfile
 from .errors import FolioCrossError
-from .infrastructure.workspace import Workspace
 from .worker.engine import WorkerEngine
 
-app = typer.Typer(no_args_is_help=True, help="FolioCross 本地图书翻译工具")
+app = typer.Typer(
+    cls=CliGroup, no_args_is_help=True, help="FolioCross 本地图书翻译工具；外部脚本请使用 --json。"
+)
 jobs_app = typer.Typer(no_args_is_help=True, help="任务查询与控制")
 glossary_app = typer.Typer(no_args_is_help=True, help="术语表管理")
 app.add_typer(jobs_app, name="jobs")
 app.add_typer(glossary_app, name="glossary")
+app.add_typer(segments_app, name="segments")
+app.add_typer(revisions_app, name="revisions")
+app.add_typer(issues_app, name="issues")
+app.add_typer(operations_app, name="operations")
 console = Console()
-
-
-def _service(context: typer.Context) -> FolioCrossService:
-    return context.obj
-
-
-def _print(value: Any, json_output: bool) -> None:
-    if json_output:
-        console.print_json(json.dumps(value, ensure_ascii=False))
-    else:
-        console.print(value)
-
-
-def _run(action, *, json_output: bool) -> None:
-    try:
-        _print(action(), json_output)
-    except FolioCrossError as error:
-        if json_output:
-            console.print_json(json.dumps(error.as_dict(), ensure_ascii=False))
-        else:
-            console.print(f"[red]错误：{error.message}[/]")
-        raise typer.Exit(1) from None
-    except Exception as error:
-        wrapped = FolioCrossError(
-            "operation_failed",
-            str(error) or "操作失败。",
-            details={"exception": type(error).__name__},
-        )
-        if json_output:
-            console.print_json(json.dumps(wrapped.as_dict(), ensure_ascii=False))
-        else:
-            console.print(f"[red]错误：{wrapped.message}[/]")
-        raise typer.Exit(1) from None
 
 
 @app.callback()
 def root(
     context: typer.Context,
     workspace: str = typer.Option(None, "--workspace", help="工作区目录；默认 ./workspace"),
+    json_output: bool = typer.Option(False, "--json", help="输出 JSON；也可以放在具体命令后"),
 ) -> None:
-    context.obj = FolioCrossService(Workspace(workspace) if workspace else Workspace.default())
+    context.obj = {"workspace": workspace}
 
 
 @app.command("app")
@@ -76,7 +54,7 @@ def launch_app(context: typer.Context) -> None:
     raise typer.Exit(run_desktop(_service(context).workspace))
 
 
-@app.command("import")
+@app.command("import", help="导入图书并创建暂停任务；相同文件复用原任务，不重置配置。")
 def import_command(
     context: typer.Context,
     path: str = typer.Argument(..., help="待导入书籍"),
@@ -152,12 +130,14 @@ def import_command(
     _run(lambda: service.import_book(path, config), json_output=json_output)
 
 
-@app.command("run")
+@app.command("run", help="开始或恢复整本翻译；默认等待完成，--background 提交到后台。")
 def run_command(
     context: typer.Context,
     job_id: str = typer.Argument(..., help="书籍 ID 或任务 ID"),
     no_export: bool = typer.Option(False, "--no-export"),
     preset: str = typer.Option("steady", "--preset"),
+    background: bool = typer.Option(False, "--background"),
+    prepare_only: bool = typer.Option(False, "--prepare-only", help="只完成译前准备后暂停"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     if preset != "steady":
@@ -166,49 +146,89 @@ def run_command(
 
     def action() -> dict[str, Any]:
         resolved = service.repository.resolve_job_id(job_id)
+        if prepare_only and no_export:
+            raise typer.BadParameter("--prepare-only 无需同时指定 --no-export。")
+        if background:
+            arguments = {"no_export": True} if no_export else {}
+            return submit(service, resolved, "prepare" if prepare_only else "run", arguments)
+        require_idle(service, resolved)
         service.control_job(resolved, "run")
+        if prepare_only:
+            return WorkerEngine(service.workspace).prepare_only(resolved)
         return WorkerEngine(service.workspace).run(resolved, export_when_done=not no_export)
 
     _run(action, json_output=json_output)
 
 
-@app.command("review")
+@app.command(
+    "review", help="主动深度审校，只生成问题；--estimate 查看估算，--background 后台执行。"
+)
 def review_command(
     context: typer.Context,
     job_id: str = typer.Argument(...),
     estimate: bool = typer.Option(False, "--estimate", help="只显示预计用量和费用"),
+    background: bool = typer.Option(False, "--background"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     service = _service(context)
-    action = (
-        (lambda: service.estimate_deep_review(job_id))
-        if estimate
-        else (lambda: WorkerEngine(service.workspace).deep_review(job_id))
-    )
+
+    def action():
+        resolved = service.repository.resolve_job_id(job_id)
+        if estimate and background:
+            raise typer.BadParameter("--estimate 与 --background 不能同时使用。")
+        if estimate:
+            return service.estimate_deep_review(resolved)
+        if background:
+            return submit(service, resolved, "review")
+        require_idle(service, resolved)
+        return WorkerEngine(service.workspace).deep_review(resolved)
+
     _run(action, json_output=json_output)
 
 
-@app.command("retranslate")
+@app.command("retranslate", help="明确重译指定段落并锁定结果；支持后台执行和版本检查。")
 def retranslate_command(
     context: typer.Context,
     job_id: str = typer.Argument(...),
     segment_id: str = typer.Argument(...),
     instruction: str = typer.Option("", "--instruction"),
+    background: bool = typer.Option(False, "--background"),
+    expected_version: int = typer.Option(None, "--expected-version", min=0),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
     service = _service(context)
-    _run(
-        lambda: WorkerEngine(service.workspace).retranslate_segment(
-            job_id, segment_id, instruction
-        ),
-        json_output=json_output,
-    )
+
+    def action():
+        resolved = service.repository.resolve_job_id(job_id)
+        segment = service.repository.segment_context(segment_id)
+        if segment["job_id"] != resolved:
+            raise FolioCrossError("segment_job_mismatch", "该段落不属于当前任务。")
+        version = segment["version"] if expected_version is None else expected_version
+        if version != segment["version"]:
+            raise FolioCrossError("segment_version_conflict", "段落已修改，请重新读取后再重译。")
+        if background:
+            return submit(
+                service,
+                resolved,
+                "retranslate",
+                {
+                    "segment_id": segment_id,
+                    "instruction": instruction,
+                    "expected_version": version,
+                },
+            )
+        require_idle(service, resolved)
+        return WorkerEngine(service.workspace).retranslate_segment(
+            resolved, segment_id, instruction, expected_version=version
+        )
+
+    _run(action, json_output=json_output)
 
 
-@jobs_app.command("list")
+@jobs_app.command("list", help="列出任务、进度和费用。")
 def jobs_list(context: typer.Context, json_output: bool = typer.Option(False, "--json")) -> None:
     rows = _service(context).repository.list_jobs()
-    if json_output:
+    if json_output or json_requested.get():
         _print({"ok": True, "jobs": rows}, True)
         return
     table = Table("任务", "书名", "状态", "阶段", "进度", "费用")
@@ -224,11 +244,12 @@ def jobs_list(context: typer.Context, json_output: bool = typer.Option(False, "-
     console.print(table)
 
 
-@jobs_app.command("status")
+@jobs_app.command("status", help="读取任务、章节、问题、用量、产物和当前后台操作。")
 def jobs_status(
     context: typer.Context, job_id: str, json_output: bool = typer.Option(False, "--json")
 ) -> None:
     service = _service(context)
+    job_id = service.repository.resolve_job_id(job_id)
     _run(
         lambda: {
             "ok": True,
@@ -237,55 +258,145 @@ def jobs_status(
             "issues": service.repository.list_issues(job_id),
             "usage": service.repository.usage_summary(job_id),
             "artifacts": service.repository.list_artifacts(job_id),
+            "background_operation": service.repository.active_background_operation(job_id),
         },
         json_output=json_output,
     )
 
 
 def _control(context: typer.Context, job_id: str, action: str, json_output: bool) -> None:
-    _run(lambda: _service(context).control_job(job_id, action), json_output=json_output)
+    def control():
+        service = _service(context)
+        resolved = service.repository.resolve_job_id(job_id)
+        result = service.control_job(resolved, action)
+        removed = service.repository.cancel_queued_background_operation(resolved)
+        if removed:
+            service.repository.update_job(
+                resolved,
+                status="cancelled" if action == "cancel" else "paused",
+                message="排队操作已取消" if action == "cancel" else "排队操作已暂停",
+            )
+        return {**result, "queued_operation_stopped": removed}
+
+    _run(control, json_output=json_output)
 
 
-@jobs_app.command("pause")
+@jobs_app.command("pause", help="请求安全暂停翻译；排队中的操作直接停止。请查询状态确认生效。")
 def jobs_pause(
     context: typer.Context, job_id: str, json_output: bool = typer.Option(False, "--json")
 ) -> None:
     _control(context, job_id, "pause", json_output)
 
 
-@jobs_app.command("resume")
+@jobs_app.command("resume", help="从已保存进度继续翻译；支持 --background。")
 def jobs_resume(
-    context: typer.Context, job_id: str, json_output: bool = typer.Option(False, "--json")
+    context: typer.Context,
+    job_id: str,
+    json_output: bool = typer.Option(False, "--json"),
+    background: bool = typer.Option(False, "--background"),
 ) -> None:
     service = _service(context)
 
     def action() -> dict[str, Any]:
         resolved = service.repository.resolve_job_id(job_id)
+        if background:
+            return submit(service, resolved, "run")
+        require_idle(service, resolved)
         service.control_job(resolved, "resume")
         return WorkerEngine(service.workspace).run(resolved)
 
     _run(action, json_output=json_output)
 
 
-@jobs_app.command("cancel")
+@jobs_app.command("cancel", help="请求取消翻译；已保存译文保留，排队中的操作直接停止。")
 def jobs_cancel(
     context: typer.Context, job_id: str, json_output: bool = typer.Option(False, "--json")
 ) -> None:
     _control(context, job_id, "cancel", json_output)
 
 
-@app.command("export")
+@app.command("export", help="从已保存译文重新导出；支持指定路径和 --background。")
 def export_command(
     context: typer.Context,
     job_id: str,
     format_name: str = typer.Option(None, "--format"),
     output: str = typer.Option(None, "--output"),
+    background: bool = typer.Option(False, "--background"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    _run(lambda: _service(context).export(job_id, format_name, output), json_output=json_output)
+    def action():
+        service = _service(context)
+        resolved = service.repository.resolve_job_id(job_id)
+        selected_format = (
+            format_name or service.repository.get_job(resolved)["config"]["output_format"]
+        ).lower()
+        if selected_format not in {"epub", "docx", "html", "txt", "md", "markdown"}:
+            raise FolioCrossError("unsupported_output", f"不支持的输出格式：{selected_format}")
+        target = str(Path(output).resolve()) if output else None
+        if background:
+            arguments = {"format_name": selected_format}
+            if target:
+                arguments["output_path"] = target
+            return submit(service, resolved, "export", arguments)
+        require_idle(service, resolved)
+        result = WorkerEngine(service.workspace).export_only(resolved, selected_format, target)
+        return {**result, "path": result["output"]}
+
+    _run(action, json_output=json_output)
 
 
-@glossary_app.command("export")
+@jobs_app.command("chapters", help="按原书顺序列出章节 ID、标题和翻译进度。")
+def jobs_chapters(
+    context: typer.Context, job_id: str, json_output: bool = typer.Option(False, "--json")
+):
+    def action():
+        repo = _service(context).repository
+        resolved = repo.resolve_job_id(job_id)
+        return {"ok": True, "job_id": resolved, "chapters": repo.chapters_for_job(resolved)}
+
+    _run(action, json_output=json_output)
+
+
+@jobs_app.command("stop", help="立即停止该任务的后台 Worker，保留已保存进度供恢复。")
+def jobs_stop(
+    context: typer.Context, job_id: str, json_output: bool = typer.Option(False, "--json")
+):
+    def action():
+        from .worker.scheduler import ensure_scheduler
+
+        service = _service(context)
+        repo = service.repository
+        resolved = repo.resolve_job_id(job_id)
+        if repo.cancel_queued_background_operation(resolved):
+            service.control_job(resolved, "pause")
+            repo.update_job(resolved, status="paused", message="排队操作已停止")
+            return {"ok": True, "job_id": resolved, "stop_requested": True}
+        requested = repo.request_background_operation_cancel(resolved)
+        if requested:
+            ensure_scheduler(service.workspace)
+        return {"ok": True, "job_id": resolved, "stop_requested": requested}
+
+    _run(action, json_output=json_output)
+
+
+@glossary_app.command("list", help="读取当前术语表与冻结版本信息，无需导出文件。")
+def glossary_list(
+    context: typer.Context, job_id: str, json_output: bool = typer.Option(False, "--json")
+):
+    def action():
+        repo = _service(context).repository
+        resolved = repo.resolve_job_id(job_id)
+        return {
+            "ok": True,
+            "job_id": resolved,
+            "terms": repo.list_glossary(resolved),
+            "snapshot": repo.glossary_snapshot(resolved),
+        }
+
+    _run(action, json_output=json_output)
+
+
+@glossary_app.command("export", help="将术语表导出为 UTF-8 JSON 文件。")
 def glossary_export(
     context: typer.Context,
     job_id: str = typer.Argument(..., help="书籍 ID 或任务 ID"),
@@ -306,7 +417,7 @@ def glossary_export(
     _run(action, json_output=json_output)
 
 
-@glossary_app.command("import")
+@glossary_app.command("import", help="导入 JSON 术语数组；不会自动替换运行任务已冻结的术语版本。")
 def glossary_import(
     context: typer.Context,
     job_id: str,
@@ -330,7 +441,7 @@ def glossary_import(
     _run(action, json_output=json_output)
 
 
-@glossary_app.command("refresh")
+@glossary_app.command("refresh", help="明确刷新冻结术语版本；运行中的任务需要先暂停。")
 def glossary_refresh(
     context: typer.Context,
     job_id: str,
@@ -343,7 +454,7 @@ def glossary_refresh(
     )
 
 
-@app.command("migrate-wenyi")
+@app.command("migrate-wenyi", help="列出旧状态；指定 --state 和 --source 后只读复制导入。")
 def migrate_wenyi(
     context: typer.Context,
     wenyi_root: str = typer.Argument(...),
@@ -351,7 +462,9 @@ def migrate_wenyi(
     source: str = typer.Option(None, "--source", help="与状态匹配的原始书籍"),
     json_output: bool = typer.Option(False, "--json"),
 ) -> None:
-    if not state_dir or not source:
+    if bool(state_dir) != bool(source):
+        raise typer.BadParameter("--state 和 --source 必须一起提供。")
+    if not state_dir:
         _run(
             lambda: {
                 "ok": True,
@@ -367,7 +480,7 @@ def migrate_wenyi(
     )
 
 
-@app.command("doctor")
+@app.command("doctor", help="检查本机依赖和模型配置；仅 --live-model 会发起真实连接检查。")
 def doctor(
     context: typer.Context,
     json_output: bool = typer.Option(False, "--json"),

@@ -15,6 +15,7 @@ from ..errors import FolioCrossError
 from ..infrastructure.formats.conversion import is_kindle_format
 from ..infrastructure.formats.markers import MARKER_PATTERN
 from ..infrastructure.repository import sha256_file, utc_now
+from .migration_structure import restore_wenyi_structure
 from .service import FolioCrossService
 
 
@@ -153,13 +154,6 @@ def map_wenyi_segments(
     return mappings, problems
 
 
-def _joined_translation(rows: list[dict[str, Any]], key: str) -> str:
-    values = [row.get(key) for row in rows]
-    if not values or not all(isinstance(value, str) and value.strip() for value in values):
-        return ""
-    return "".join(str(value) for value in values)
-
-
 def _copy_legacy_outputs(
     service: FolioCrossService, source: Path, book_id: str, job_id: str
 ) -> list[dict[str, str]]:
@@ -273,9 +267,24 @@ def migrate_wenyi_state(
     mappings, mapping_problems = map_wenyi_segments(old_state, manifest, new_segments)
     translated = 0
     before_polish = 0
+    structure_review_segments = 0
     for new_segment, old_segments in mappings:
-        base = _joined_translation(old_segments, "target_before_polish")
-        final = _joined_translation(old_segments, "target") or base
+        base, base_uncertain = restore_wenyi_structure(
+            new_segment, old_segments, "target_before_polish"
+        )
+        final, uncertain = restore_wenyi_structure(new_segment, old_segments, "target")
+        if not final:
+            final, uncertain = base, base_uncertain
+        if final and uncertain:
+            structure_review_segments += 1
+            service.repository.create_issue(
+                job_id,
+                segment_id=new_segment["id"],
+                category="migration_structure",
+                severity="warning",
+                message="旧译文的部分行内格式按原文位置比例恢复，请检查位置。",
+                evidence={"fallback_markers": uncertain},
+            )
         if base:
             service.repository.save_segment_revision(
                 new_segment["id"], base, origin="wenyi_translation", model="legacy"
@@ -354,6 +363,23 @@ def migrate_wenyi_state(
     if glossary_count:
         service.repository.freeze_glossary(job_id)
 
+    service.repository.update_step(
+        job_id,
+        "prepare",
+        status="done",
+        completed=len(chapters),
+        total=len(chapters),
+        message="全书理解和冻结术语已从 Wenyi 导入",
+    )
+    service.repository.update_step(
+        job_id,
+        "translate",
+        status="done",
+        completed=translated,
+        total=len(new_segments),
+        message="Wenyi 译文已完成映射",
+    )
+
     usage_path = old_state / "usage.json"
     usage = {}
     if usage_path.is_file():
@@ -402,6 +428,7 @@ def migrate_wenyi_state(
         "mapped_segments": len(mappings),
         "mapping_problems": mapping_problems,
         "pre_polish_revisions": before_polish,
+        "structure_review_segments": structure_review_segments,
         "glossary_terms": glossary_count,
         "glossary_conflicts": glossary_conflicts,
         "book_context_imported": bool(analysis),

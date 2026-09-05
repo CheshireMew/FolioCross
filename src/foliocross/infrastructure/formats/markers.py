@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -107,18 +108,68 @@ def validate_markers(text: str, markers: list[dict[str, Any]]) -> list[str]:
     return issues
 
 
+def strip_protected_markers(text: str) -> str:
+    """Return reader-visible text without FolioCross's internal marker tokens."""
+    return MARKER_PATTERN.sub("", text)
+
+
+def restore_protected_markers(
+    source: str,
+    reference_target: str,
+    edited_text: str,
+    markers: list[dict[str, Any]],
+) -> str:
+    """Restore protected markers after a user edits only the visible translation."""
+    visible_edit = strip_protected_markers(edited_text)
+    if not markers:
+        return visible_edit
+
+    source_visible = strip_protected_markers(source)
+    reference_visible = strip_protected_markers(reference_target)
+    edits = SequenceMatcher(None, reference_visible, visible_edit, autojunk=False).get_opcodes()
+
+    def mapped_offset(offset: int, kind: str) -> int:
+        # At an insertion boundary, keep an opening tag with the following text
+        # and a closing tag/note with the preceding text.
+        for operation, old_start, old_end, new_start, new_end in edits:
+            if operation == "insert" and offset == old_start:
+                return new_end if kind == "tag_start" else new_start
+        for operation, old_start, old_end, new_start, new_end in edits:
+            if old_start <= offset <= old_end:
+                if operation == "equal":
+                    return new_start + offset - old_start
+                ratio = (offset - old_start) / max(1, old_end - old_start)
+                return new_start + round((new_end - new_start) * ratio)
+        return len(visible_edit)
+
+    placements: list[tuple[int, str]] = []
+    previous_offset = 0
+    for marker in markers:
+        token = str(marker["token"])
+        token_index = reference_target.find(token)
+        if token_index >= 0 and reference_visible:
+            visible_offset = len(strip_protected_markers(reference_target[:token_index]))
+            edit_offset = mapped_offset(visible_offset, str(marker.get("kind", "")))
+        else:
+            ratio = float(marker.get("source_offset", 0)) / max(1, len(source_visible))
+            edit_offset = round(len(visible_edit) * min(1.0, max(0.0, ratio)))
+        edit_offset = max(previous_offset, edit_offset)
+        placements.append((edit_offset, token))
+        previous_offset = edit_offset
+
+    chunks: list[str] = []
+    cursor = 0
+    for offset, token in placements:
+        chunks.append(visible_edit[cursor:offset])
+        chunks.append(token)
+        cursor = offset
+    chunks.append(visible_edit[cursor:])
+    return "".join(chunks)
+
+
 def repair_missing_markers(source: str, target: str, markers: list[dict[str, Any]]) -> str:
-    """Place missing markers at proportional offsets without deleting model output."""
-    repaired = target
-    missing = [marker for marker in markers if marker["token"] not in repaired]
-    source_visible = MARKER_PATTERN.sub("", source)
-    for marker in missing:
-        ratio = min(
-            1.0, max(0.0, float(marker.get("source_offset", 0)) / max(1, len(source_visible)))
-        )
-        offset = round(len(repaired) * ratio)
-        repaired = repaired[:offset] + str(marker["token"]) + repaired[offset:]
-    return repaired
+    """Restore missing or invalid tokens without changing the visible translation."""
+    return restore_protected_markers(source, target, target, markers)
 
 
 def render_fragment(target: str, markers: list[dict[str, Any]]) -> str:

@@ -33,11 +33,22 @@ def run_desktop(workspace: Workspace | None = None) -> int:
         def notify(event_type: str, payload: str) -> None:
             del payload
             if event_type == "job.completed":
-                tray.showMessage("FolioCross", "图书翻译与导出已经完成。")
+                tray.showMessage(
+                    "FolioCross",
+                    (
+                        "Book translation and export are complete."
+                        if controller.uiLanguage == "en"
+                        else "图书翻译与导出已经完成。"
+                    ),
+                )
             elif event_type == "job.failed":
                 tray.showMessage(
                     "FolioCross",
-                    "图书翻译失败，请回到任务工作台查看原因。",
+                    (
+                        "Book translation failed. Open the job workspace for details."
+                        if controller.uiLanguage == "en"
+                        else "图书翻译失败，请回到任务工作台查看原因。"
+                    ),
                     QSystemTrayIcon.Critical,
                 )
 

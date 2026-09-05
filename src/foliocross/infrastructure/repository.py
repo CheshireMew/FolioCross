@@ -65,7 +65,8 @@ class Repository:
         }
         with self.workspace.session() as connection:
             rows = connection.execute(
-                "SELECT id,status FROM jobs WHERE status IN (?,?,?,?)",
+                """SELECT id,status,active_elapsed_seconds,active_started_at
+                FROM jobs WHERE status IN (?,?,?,?)""",
                 tuple(active_states),
             ).fetchall()
         recovered = []
@@ -73,15 +74,27 @@ class Repository:
             if self._job_lock_is_held(row["id"]):
                 continue
             now = utc_now()
+            active_elapsed = float(row["active_elapsed_seconds"] or 0)
+            if row["active_started_at"]:
+                try:
+                    started = datetime.fromisoformat(
+                        str(row["active_started_at"]).replace("Z", "+00:00")
+                    )
+                    ended = datetime.fromisoformat(now.replace("Z", "+00:00"))
+                    active_elapsed += max(0.0, (ended - started).total_seconds())
+                except ValueError:
+                    pass
             with self.workspace.transaction(immediate=True) as connection:
                 changed = connection.execute(
-                    """UPDATE jobs SET status=?,desired_state=?,current_message=?,updated_at=?
+                    """UPDATE jobs SET status=?,desired_state=?,current_message=?,updated_at=?,
+                    active_elapsed_seconds=?,active_started_at=NULL
                     WHERE id=? AND status=?""",
                     (
                         JobStatus.INTERRUPTED.value,
                         DesiredState.PAUSE.value,
                         "上次运行意外中断，可以从已完成的批次继续",
                         now,
+                        active_elapsed,
                         row["id"],
                         row["status"],
                     ),
@@ -371,30 +384,276 @@ class Repository:
         heartbeat: bool = False,
         finished: bool = False,
     ) -> None:
-        fields = ["updated_at=?"]
-        values: list[Any] = [utc_now()]
-        for name, value in (
-            ("status", status),
-            ("stage", stage),
-            ("current_message", message),
-            ("error_code", error_code),
-            ("error_message", error_message),
-        ):
-            if value is not None:
-                fields.append(f"{name}=?")
-                values.append(value)
-        if heartbeat:
-            fields.append("heartbeat_at=?")
-            values.append(utc_now())
-        if status in {JobStatus.PREPARING.value, JobStatus.TRANSLATING.value}:
-            fields.append("started_at=COALESCE(started_at,?)")
-            values.append(utc_now())
-        if finished:
-            fields.append("finished_at=?")
-            values.append(utc_now())
-        values.append(job_id)
+        now = utc_now()
+        active_states = {
+            JobStatus.PREPARING.value,
+            JobStatus.TRANSLATING.value,
+            JobStatus.QUALITY_CHECK.value,
+            JobStatus.EXPORTING.value,
+        }
         with self.workspace.transaction(immediate=True) as connection:
+            current = connection.execute(
+                "SELECT status,active_elapsed_seconds,active_started_at FROM jobs WHERE id=?",
+                (job_id,),
+            ).fetchone()
+            if not current:
+                raise FolioCrossError("job_not_found", f"找不到任务：{job_id}")
+            next_status = status or str(current["status"])
+            was_active = str(current["status"]) in active_states
+            will_be_active = next_status in active_states
+            active_elapsed = float(current["active_elapsed_seconds"] or 0)
+            active_started_at = current["active_started_at"]
+            if was_active and not will_be_active and active_started_at:
+                try:
+                    started = datetime.fromisoformat(str(active_started_at).replace("Z", "+00:00"))
+                    ended = datetime.fromisoformat(now.replace("Z", "+00:00"))
+                    active_elapsed += max(0.0, (ended - started).total_seconds())
+                except ValueError:
+                    pass
+                active_started_at = None
+            elif not was_active and will_be_active:
+                active_started_at = now
+
+            fields = ["updated_at=?"]
+            values: list[Any] = [now]
+            for name, value in (
+                ("status", status),
+                ("stage", stage),
+                ("current_message", message),
+                ("error_code", error_code),
+                ("error_message", error_message),
+            ):
+                if value is not None:
+                    fields.append(f"{name}=?")
+                    values.append(value)
+            if heartbeat:
+                fields.append("heartbeat_at=?")
+                values.append(now)
+            if status in {JobStatus.PREPARING.value, JobStatus.TRANSLATING.value}:
+                fields.append("started_at=COALESCE(started_at,?)")
+                values.append(now)
+            if was_active != will_be_active:
+                fields.extend(("active_elapsed_seconds=?", "active_started_at=?"))
+                values.extend((active_elapsed, active_started_at))
+            if finished:
+                fields.append("finished_at=?")
+                values.append(now)
+            values.append(job_id)
             connection.execute(f"UPDATE jobs SET {', '.join(fields)} WHERE id=?", values)
+
+    def enqueue_background_operation(
+        self,
+        job_id: str,
+        action: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        activate: bool = False,
+    ) -> dict[str, Any]:
+        allowed = {"run", "prepare", "review", "retranslate", "export"}
+        if action not in allowed:
+            raise FolioCrossError("invalid_background_action", f"不支持的后台操作：{action}")
+        arguments = arguments or {}
+        with self.workspace.transaction(immediate=True) as connection:
+            if not connection.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
+                raise FolioCrossError("job_not_found", f"找不到任务：{job_id}")
+            existing = connection.execute(
+                """SELECT * FROM background_operations
+                WHERE job_id=? AND status IN ('queued','running')
+                ORDER BY created_at LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+            if existing:
+                item = self._decode_background_operation(dict(existing))
+                if item["action"] == action and item["arguments"] == arguments:
+                    return item
+                raise FolioCrossError(
+                    "background_operation_active",
+                    "这本书已有后台操作正在排队或运行，请等待完成后再试。",
+                )
+            operation_id = new_id()
+            now = utc_now()
+            if activate and action in {"run", "prepare"}:
+                connection.execute(
+                    "UPDATE jobs SET desired_state='run',status='queued',current_message=?,updated_at=? WHERE id=?",
+                    ("已进入后台队列", now, job_id),
+                )
+            connection.execute(
+                """INSERT INTO background_operations(
+                    id,job_id,action,arguments_json,status,created_at
+                ) VALUES (?,?,?,?,?,?)""",
+                (operation_id, job_id, action, json_text(arguments), "queued", now),
+            )
+            self._insert_event(
+                connection,
+                job_id,
+                "operation.queued",
+                {"operation_id": operation_id, "action": action},
+            )
+            row = connection.execute(
+                "SELECT * FROM background_operations WHERE id=?", (operation_id,)
+            ).fetchone()
+        return self._decode_background_operation(dict(row))
+
+    def background_operation(self, operation_id: str) -> dict[str, Any]:
+        with self.workspace.session() as connection:
+            row = connection.execute(
+                "SELECT * FROM background_operations WHERE id=?", (operation_id,)
+            ).fetchone()
+        if not row:
+            raise FolioCrossError("operation_not_found", f"找不到后台操作：{operation_id}")
+        return self._decode_background_operation(dict(row))
+
+    def segment_page(
+        self,
+        job_id: str,
+        *,
+        chapter_id: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+        query: str = "",
+    ) -> dict[str, Any]:
+        job = self.get_job(job_id)
+        clause = "c.book_id=?"
+        values: list[Any] = [job["book_id"]]
+        with self.workspace.transaction() as connection:
+            if chapter_id:
+                if not connection.execute(
+                    "SELECT 1 FROM chapters WHERE id=? AND book_id=?",
+                    (chapter_id, job["book_id"]),
+                ).fetchone():
+                    raise FolioCrossError("chapter_not_found", "该任务中找不到指定章节。")
+                clause += " AND c.id=?"
+                values.append(chapter_id)
+            if query:
+                clause += " AND (instr(s.source_text,?)>0 OR instr(s.target_text,?)>0)"
+                values.extend([query, query])
+            base = f"FROM segments s JOIN chapters c ON c.id=s.chapter_id WHERE {clause}"
+            total = connection.execute(f"SELECT COUNT(*) {base}", values).fetchone()[0]
+            rows = connection.execute(
+                f"SELECT s.*,c.chapter_index,c.title chapter_title {base} "
+                "ORDER BY c.chapter_index,s.segment_index,s.id LIMIT ? OFFSET ?",
+                [*values, limit, offset],
+            ).fetchall()
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "segments": [self._decode_segment(dict(row)) for row in rows],
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "next_offset": offset + len(rows) if offset + len(rows) < total else None,
+        }
+
+    def background_operations(self, *statuses: str) -> list[dict[str, Any]]:
+        query = "SELECT * FROM background_operations"
+        values: tuple[Any, ...] = ()
+        if statuses:
+            placeholders = ",".join("?" for _ in statuses)
+            query += f" WHERE status IN ({placeholders})"
+            values = tuple(statuses)
+        query += " ORDER BY created_at,id"
+        with self.workspace.session() as connection:
+            rows = connection.execute(query, values).fetchall()
+        return [self._decode_background_operation(dict(row)) for row in rows]
+
+    def active_background_operation(self, job_id: str) -> dict[str, Any] | None:
+        with self.workspace.session() as connection:
+            row = connection.execute(
+                """SELECT * FROM background_operations
+                WHERE job_id=? AND status IN ('queued','running')
+                ORDER BY created_at LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+        return self._decode_background_operation(dict(row)) if row else None
+
+    def mark_background_operation_running(self, operation_id: str, pid: int) -> None:
+        now = utc_now()
+        with self.workspace.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT job_id,action FROM background_operations WHERE id=? AND status='queued'",
+                (operation_id,),
+            ).fetchone()
+            if not row:
+                raise FolioCrossError(
+                    "background_operation_not_queued", "后台操作已不在等待队列中。"
+                )
+            connection.execute(
+                """UPDATE background_operations SET status='running',pid=?,started_at=?
+                WHERE id=?""",
+                (int(pid), now, operation_id),
+            )
+            self._insert_event(
+                connection,
+                row["job_id"],
+                "operation.started",
+                {"operation_id": operation_id, "action": row["action"], "pid": int(pid)},
+            )
+
+    def finish_background_operation(
+        self,
+        operation_id: str,
+        *,
+        status: str,
+        exit_code: int | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        if status not in {"completed", "failed", "cancelled"}:
+            raise ValueError(f"invalid terminal operation status: {status}")
+        now = utc_now()
+        with self.workspace.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT job_id,action,status FROM background_operations WHERE id=?",
+                (operation_id,),
+            ).fetchone()
+            if not row or row["status"] not in {"queued", "running"}:
+                return
+            connection.execute(
+                """UPDATE background_operations
+                SET status=?,exit_code=?,error_message=?,finished_at=? WHERE id=?""",
+                (status, exit_code, error_message, now, operation_id),
+            )
+            self._insert_event(
+                connection,
+                row["job_id"],
+                f"operation.{status}",
+                {
+                    "operation_id": operation_id,
+                    "action": row["action"],
+                    "exit_code": exit_code,
+                    "message": error_message or "",
+                },
+            )
+
+    def request_background_operation_cancel(self, job_id: str) -> bool:
+        with self.workspace.transaction(immediate=True) as connection:
+            changed = connection.execute(
+                """UPDATE background_operations SET cancel_requested=1
+                WHERE job_id=? AND status='running'""",
+                (job_id,),
+            ).rowcount
+        return bool(changed)
+
+    def cancel_queued_background_operation(self, job_id: str) -> bool:
+        with self.workspace.transaction(immediate=True) as connection:
+            row = connection.execute(
+                """SELECT id FROM background_operations
+                WHERE job_id=? AND status='queued' ORDER BY created_at LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+            if not row:
+                return False
+            connection.execute(
+                """UPDATE background_operations
+                SET status='cancelled',cancel_requested=1,finished_at=? WHERE id=?""",
+                (utc_now(), row["id"]),
+            )
+            self._insert_event(
+                connection,
+                job_id,
+                "operation.cancelled",
+                {"operation_id": row["id"], "reason": "cancelled_before_start"},
+            )
+        return True
 
     def update_job_config(self, job_id: str, config: JobConfig) -> None:
         with self.workspace.transaction(immediate=True) as connection:
@@ -491,8 +750,19 @@ class Repository:
         expected_version: int | None = None,
         quality: dict[str, Any] | None = None,
         allow_locked: bool = False,
+        accepted_issue_id: str | None = None,
     ) -> int:
         with self.workspace.transaction(immediate=True) as connection:
+            if accepted_issue_id is not None:
+                issue = connection.execute(
+                    "SELECT segment_id,status FROM review_issues WHERE id=?", (accepted_issue_id,)
+                ).fetchone()
+                if not issue or issue["segment_id"] != segment_id:
+                    raise FolioCrossError("issue_not_found", "找不到该段落的审校问题。")
+                if issue["status"] != "open":
+                    raise FolioCrossError(
+                        "issue_already_resolved", "该问题已经处理，请重新读取问题状态。"
+                    )
             current = connection.execute(
                 "SELECT version,locked FROM segments WHERE id=?", (segment_id,)
             ).fetchone()
@@ -509,6 +779,11 @@ class Repository:
             version = int(current["version"]) + 1
             revision_id = new_id()
             now = utc_now()
+            if accepted_issue_id is not None:
+                connection.execute(
+                    "UPDATE review_issues SET suggestion=?,status='accepted',resolved_at=? WHERE id=?",
+                    (text, now, accepted_issue_id),
+                )
             connection.execute(
                 """INSERT INTO segment_revisions(
                     id,segment_id,version,text,origin,model,instruction,created_at
@@ -708,6 +983,43 @@ class Repository:
             item["alternatives"] = decode_json(item.pop("alternatives_json"), [])
             result.append(item)
         return result
+
+    def glossary_page(
+        self,
+        job_id: str,
+        *,
+        query: str = "",
+        offset: int = 0,
+        limit: int = 100,
+    ) -> tuple[list[dict[str, Any]], int]:
+        where = "job_id=?"
+        values: list[Any] = [job_id]
+        search = query.strip()
+        if search:
+            escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            where += (
+                " AND (source LIKE ? ESCAPE '\\' OR target LIKE ? ESCAPE '\\'"
+                " OR alternatives_json LIKE ? ESCAPE '\\')"
+            )
+            values.extend((pattern, pattern, pattern))
+        with self.workspace.session() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM glossary_terms WHERE {where}", values
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"""SELECT * FROM glossary_terms WHERE {where}
+                ORDER BY first_chapter,source LIMIT ? OFFSET ?""",
+                (*values, max(1, int(limit)), max(0, int(offset))),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["alternatives"] = decode_json(item.pop("alternatives_json"), [])
+            result.append(item)
+        return result, total
 
     def record_glossary_conflict(
         self,
@@ -972,6 +1284,23 @@ class Repository:
             ).fetchall()
         result = []
         for row in reversed(rows):
+            item = dict(row)
+            item["payload"] = decode_json(item.pop("payload_json"), {})
+            result.append(item)
+        return result
+
+    def latest_event_sequence(self) -> int:
+        with self.workspace.session() as connection:
+            row = connection.execute("SELECT COALESCE(MAX(seq),0) FROM events").fetchone()
+        return int(row[0] or 0)
+
+    def events_after(self, sequence: int, *, limit: int = 200) -> list[dict[str, Any]]:
+        with self.workspace.session() as connection:
+            rows = connection.execute(
+                "SELECT * FROM events WHERE seq>? ORDER BY seq LIMIT ?", (int(sequence), limit)
+            ).fetchall()
+        result = []
+        for row in rows:
             item = dict(row)
             item["payload"] = decode_json(item.pop("payload_json"), {})
             result.append(item)
@@ -1247,8 +1576,18 @@ class Repository:
         finished_at = item.get("finished_at")
         completed = int(item.get("completed_segments") or 0)
         total = int(item.get("total_segments") or 0)
-        elapsed = 0.0
-        if started_at:
+        elapsed = float(item.get("active_elapsed_seconds") or 0)
+        active_started_at = item.get("active_started_at")
+        if active_started_at:
+            try:
+                active_started = datetime.fromisoformat(
+                    str(active_started_at).replace("Z", "+00:00")
+                )
+                elapsed += max(0.0, (datetime.now(timezone.utc) - active_started).total_seconds())
+            except ValueError:
+                pass
+        elif elapsed <= 0 and started_at:
+            # Workspaces created before active-time tracking retain a useful historical estimate.
             try:
                 started = datetime.fromisoformat(str(started_at).replace("Z", "+00:00"))
                 end = (
@@ -1258,7 +1597,7 @@ class Repository:
                 )
                 elapsed = max(0.0, (end - started).total_seconds())
             except ValueError:
-                elapsed = 0.0
+                pass
         speed = completed / elapsed * 60 if elapsed > 0 and completed else 0.0
         item["elapsed_seconds"] = round(elapsed, 1)
         item["segments_per_minute"] = round(speed, 2)
@@ -1267,6 +1606,12 @@ class Repository:
             if speed > 0 and completed < total and item.get("status") == JobStatus.TRANSLATING.value
             else None
         )
+        return item
+
+    @staticmethod
+    def _decode_background_operation(item: dict[str, Any]) -> dict[str, Any]:
+        item["arguments"] = decode_json(item.pop("arguments_json", "{}"), {})
+        item["cancel_requested"] = bool(item.get("cancel_requested"))
         return item
 
     @staticmethod

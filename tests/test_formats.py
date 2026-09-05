@@ -16,7 +16,14 @@ from foliocross.infrastructure.formats.docx import export_docx_template, parse_d
 from foliocross.infrastructure.formats.epub import export_epub_template, parse_epub
 from foliocross.infrastructure.formats.fb2 import parse_fb2
 from foliocross.infrastructure.formats.htmlish import content_blocks, fill_html_template, parse_html
-from foliocross.infrastructure.formats.markers import serialize_block, validate_markers
+from foliocross.infrastructure.formats.markers import (
+    render_fragment,
+    repair_missing_markers,
+    restore_protected_markers,
+    serialize_block,
+    strip_protected_markers,
+    validate_markers,
+)
 from foliocross.infrastructure.formats.text import parse_text
 
 ONE_PIXEL_PNG = base64.b64decode(
@@ -119,6 +126,24 @@ def test_marker_validator_detects_loss(tmp_path: Path):
     assert validate_markers(missing, segment.markers)
 
 
+def test_manual_visible_edit_restores_protected_markers(tmp_path: Path):
+    source = write_sample_epub(tmp_path / "book.epub")
+    book = parse_epub(str(source))
+    segment = next(s for c in book.chapters for s in c.segments if s.markers)
+    visible_edit = "这是一段经过人工改写的重要文字。"
+
+    restored = restore_protected_markers(
+        segment.source_text,
+        segment.source_text,
+        visible_edit + segment.markers[0]["token"],
+        segment.markers,
+    )
+
+    assert strip_protected_markers(restored) == visible_edit
+    assert validate_markers(restored, segment.markers) == []
+    assert restored.count(segment.markers[0]["token"]) == 1
+
+
 def test_nested_inline_annotation_marker_order_is_valid():
     soup = BeautifulSoup(
         '<p>Before <em>important<a epub:type="noteref" href="#n1">1</a></em> after.</p>',
@@ -131,6 +156,29 @@ def test_nested_inline_annotation_marker_order_is_valid():
         "annotation",
         "tag_end",
     ]
+
+
+def test_manual_edit_keeps_markup_attached_to_unchanged_words():
+    soup = BeautifulSoup(
+        '<p>Before <em>important</em> text<a epub:type="noteref" href="#n1">1</a>.</p>',
+        "html.parser",
+    )
+    source, markers = serialize_block(soup.p, identity="edit-positions")
+    edited = "A much longer introduction before important text."
+    restored = restore_protected_markers(source, source, edited, markers)
+    output = BeautifulSoup(render_fragment(restored, markers), "html.parser")
+    assert output.em.get_text() == "important"
+    assert str(output).endswith('text<a epub:type="noteref" href="#n1">1</a>.')
+    assert strip_protected_markers(restored) == edited
+    assert validate_markers(restored, markers) == []
+
+
+def test_marker_fallback_restores_nested_order_without_changing_visible_text():
+    soup = BeautifulSoup("<p>Before <em><strong>important</strong></em> after.</p>", "html.parser")
+    source, markers = serialize_block(soup.p, identity="fallback-order")
+    restored = repair_missing_markers(source, "之前重要之后。", markers)
+    assert validate_markers(restored, markers) == []
+    assert strip_protected_markers(restored) == "之前重要之后。"
 
 
 def test_long_marked_epub_segment_splits_and_reassembles_exactly(tmp_path: Path):

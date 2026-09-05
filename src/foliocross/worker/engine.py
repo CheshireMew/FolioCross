@@ -532,6 +532,7 @@ class WorkerEngine:
                 {"stage": "deep_review", "model": config.profile.review_model},
             )
             created = 0
+            succeeded = False
             try:
                 for batch in batches(translated, config.max_chars_per_batch):
                     payload = {
@@ -580,13 +581,18 @@ class WorkerEngine:
                         )
                         created += 1
                 self.emitter.emit(job_id, "review.completed", {"issues_created": created})
+                succeeded = True
                 return {"ok": True, "job_id": job_id, "issues_created": created}
             finally:
                 self.repository.update_job(
                     job_id,
                     status=original_status,
                     stage=original_stage,
-                    message=f"深度审校完成，新增 {created} 个待检查问题",
+                    message=(
+                        f"深度审校完成，新增 {created} 个待检查问题"
+                        if succeeded
+                        else "深度审校未完成，请查看任务日志"
+                    ),
                 )
 
     def prepare_only(self, job_id: str) -> dict[str, Any]:
@@ -639,7 +645,12 @@ class WorkerEngine:
                 raise
 
     def retranslate_segment(
-        self, job_id: str, segment_id: str, instruction: str = ""
+        self,
+        job_id: str,
+        segment_id: str,
+        instruction: str = "",
+        *,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         """Retranslate one segment and preserve the result as a locked revision."""
 
@@ -648,6 +659,12 @@ class WorkerEngine:
             segment = self.repository.segment_context(segment_id)
             if segment["job_id"] != job_id:
                 raise FolioCrossError("segment_job_mismatch", "该段落不属于当前任务。")
+            if expected_version is not None and segment["version"] != expected_version:
+                raise FolioCrossError(
+                    "segment_version_conflict",
+                    "段落已修改，请重新读取后再重译。",
+                    details={"expected": expected_version, "actual": segment["version"]},
+                )
             config = JobConfig.from_dict(job["config"])
             runtime = LLMRuntime(
                 self.repository,
@@ -690,6 +707,7 @@ class WorkerEngine:
                 segment_id,
                 translation,
                 origin="retranslation",
+                expected_version=segment["version"],
                 model=config.profile.translation_model,
                 instruction=instruction.strip(),
                 lock=True,
@@ -709,7 +727,9 @@ class WorkerEngine:
                 "translation": translation,
             }
 
-    def export_only(self, job_id: str, format_name: str) -> dict[str, Any]:
+    def export_only(
+        self, job_id: str, format_name: str, output_path: str | None = None
+    ) -> dict[str, Any]:
         """Re-export committed translations without invoking a model."""
 
         with job_lock(self.workspace, job_id):
@@ -722,21 +742,34 @@ class WorkerEngine:
                 stage="export",
                 message=f"正在重新生成 {format_name.upper()}",
             )
+            succeeded = False
             try:
-                output = export_job(self.repository, job_id, format_name)
-                self.repository.add_artifact(
+                output = export_job(self.repository, job_id, format_name, output_path)
+                artifact_id = self.repository.add_artifact(
                     job_id, kind="translation", format_name=format_name, path=output
                 )
                 self.emitter.emit(
                     job_id, "export.completed", {"format": format_name, "output": output}
                 )
-                return {"ok": True, "job_id": job_id, "format": format_name, "output": output}
+                succeeded = True
+                return {
+                    "ok": True,
+                    "job_id": job_id,
+                    "format": format_name,
+                    "output": output,
+                    "path": output,
+                    "artifact_id": artifact_id,
+                }
             finally:
                 self.repository.update_job(
                     job_id,
                     status=original_status,
                     stage=original_stage,
-                    message=f"已重新生成 {format_name.upper()}",
+                    message=(
+                        f"已重新生成 {format_name.upper()}"
+                        if succeeded
+                        else f"{format_name.upper()} 导出未完成，请查看任务日志"
+                    ),
                 )
 
     def _prepare(self, job_id: str, runtime: LLMRuntime) -> None:
@@ -745,6 +778,14 @@ class WorkerEngine:
         if not missing and self.repository.get_job(job_id).get("book_context"):
             if not self.repository.glossary_snapshot(job_id)["version"]:
                 self.repository.freeze_glossary(job_id)
+            self.repository.update_step(
+                job_id,
+                "prepare",
+                status="done",
+                completed=len(chapters),
+                total=len(chapters),
+                message="全书理解和冻结术语已经可用",
+            )
             return
         self.repository.update_job(
             job_id,
@@ -845,6 +886,14 @@ class WorkerEngine:
         chapters = self.repository.pending_chapters(job_id)
         total = self.repository.get_job(job_id)["total_segments"]
         if not chapters:
+            self.repository.update_step(
+                job_id,
+                "translate",
+                status="done",
+                completed=total,
+                total=total,
+                message="全部段落已有译文",
+            )
             return
         if len(chapters) == 1:
             remaining = self.repository.segments_for_chapter(chapters[0]["id"])

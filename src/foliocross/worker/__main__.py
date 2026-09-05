@@ -19,6 +19,8 @@ def main() -> None:
     parser.add_argument("--retranslate", metavar="SEGMENT_ID")
     parser.add_argument("--instruction", default="")
     parser.add_argument("--export-format")
+    parser.add_argument("--output")
+    parser.add_argument("--expected-version", type=int)
     args = parser.parse_args()
     try:
         engine = WorkerEngine(Workspace(args.workspace), event_sink=stdout_event_sink)
@@ -27,9 +29,11 @@ def main() -> None:
         elif args.prepare_only:
             result = engine.prepare_only(args.job)
         elif args.retranslate:
-            result = engine.retranslate_segment(args.job, args.retranslate, args.instruction)
+            result = engine.retranslate_segment(
+                args.job, args.retranslate, args.instruction, expected_version=args.expected_version
+            )
         elif args.export_format:
-            result = engine.export_only(args.job, args.export_format)
+            result = engine.export_only(args.job, args.export_format, args.output)
         else:
             result = engine.run(args.job, export_when_done=not args.no_export)
         print(

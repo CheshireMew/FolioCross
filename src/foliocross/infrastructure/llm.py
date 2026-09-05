@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -123,6 +125,9 @@ class FakeClient:
         max_tokens: int | None = None,
     ) -> ModelResponse:
         del model, system, max_tokens
+        delay = float(os.environ.get("FOLIOCROSS_FAKE_DELAY_SECONDS", "0") or 0)
+        if delay > 0:
+            time.sleep(delay)
         try:
             payload = json.loads(user[user.index("{") :])
         except (ValueError, json.JSONDecodeError):

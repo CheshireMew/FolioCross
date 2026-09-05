@@ -32,7 +32,7 @@ def test_workspace_schema_and_wal(workspace):
     with workspace.connect() as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         versions = [row[0] for row in connection.execute("SELECT version FROM schema_migrations")]
-    assert versions == [1, 2, 3, 4]
+    assert versions == [1, 2, 3, 4, 5]
 
 
 def test_import_creates_uuid_book_job_and_segments(workspace, tmp_path: Path):
@@ -194,6 +194,24 @@ def test_stale_running_job_is_marked_interrupted_and_can_be_archived(workspace, 
     service.archive_job(job_id)
     assert all(row["id"] != job_id for row in service.repository.list_jobs())
     assert any(row["id"] == job_id for row in service.repository.list_jobs(include_archived=True))
+
+
+def test_speed_uses_active_time_and_excludes_paused_wall_clock(workspace, tmp_path: Path):
+    source = tmp_path / "active-time.txt"
+    source.write_text("One paragraph.\n\nAnother paragraph.", encoding="utf-8")
+    service = FolioCrossService(workspace)
+    job_id = service.import_book(str(source), fake_config())["job_id"]
+    service.repository.update_job(job_id, status="translating", stage="translate")
+    service.repository.update_job(job_id, status="paused", message="paused")
+    with workspace.transaction(immediate=True) as connection:
+        connection.execute(
+            """UPDATE jobs SET active_elapsed_seconds=120,
+            started_at='2000-01-01T00:00:00.000Z',completed_segments=1 WHERE id=?""",
+            (job_id,),
+        )
+    job = service.repository.get_job(job_id)
+    assert 119.9 <= job["elapsed_seconds"] <= 120.1
+    assert job["segments_per_minute"] == 0.5
 
 
 def test_model_and_job_configuration_are_persisted_as_snapshots(workspace, tmp_path: Path):

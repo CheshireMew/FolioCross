@@ -22,6 +22,7 @@ from ..infrastructure.formats.conversion import (
 )
 from ..infrastructure.formats.covers import extract_cover
 from ..infrastructure.formats.exporters import export_job
+from ..infrastructure.formats.markers import restore_protected_markers, validate_markers
 from ..infrastructure.formats.registry import parse_book
 from ..infrastructure.llm import OpenAICompatibleClient, parse_json_content
 from ..infrastructure.pricing import calculate_cost, estimate_cost
@@ -259,12 +260,15 @@ class FolioCrossService:
         )
         return {"ok": True, "segment_id": segment_id, "version": version, "locked": True}
 
-    def restore_revision(self, revision_id: str) -> dict[str, Any]:
+    def restore_revision(
+        self, revision_id: str, *, expected_version: int | None = None
+    ) -> dict[str, Any]:
         revision = self.repository.revision(revision_id)
         version = self.repository.save_segment_revision(
             revision["segment_id"],
             revision["text"],
             origin="history_restore",
+            expected_version=expected_version,
             instruction=f"恢复到版本 {revision['version']}",
             lock=True,
             allow_locked=True,
@@ -319,7 +323,11 @@ class FolioCrossService:
         return {"ok": True, **snapshot}
 
     def apply_issue_suggestion(
-        self, issue_id: str, edited_suggestion: str | None = None
+        self,
+        issue_id: str,
+        edited_suggestion: str | None = None,
+        *,
+        expected_version: int | None = None,
     ) -> dict[str, Any]:
         issue = self.repository.issue(issue_id)
         suggestion = (
@@ -329,17 +337,21 @@ class FolioCrossService:
         )
         if not issue["segment_id"] or not suggestion:
             raise FolioCrossError("issue_has_no_suggestion", "这个问题没有可直接应用的修改建议。")
-        if suggestion != issue["suggestion"]:
-            self.repository.update_issue_suggestion(issue_id, suggestion)
+        segment = self.repository.segment(issue["segment_id"])
+        if validate_markers(suggestion, segment["markers"]):
+            suggestion = restore_protected_markers(
+                segment["source_text"], segment["target_text"], suggestion, segment["markers"]
+            )
         version = self.repository.save_segment_revision(
             issue["segment_id"],
             suggestion,
             origin="review_accept",
+            accepted_issue_id=issue_id,
+            expected_version=expected_version,
             instruction=issue["message"],
             lock=True,
             allow_locked=True,
         )
-        self.repository.resolve_issue(issue_id, "accepted")
         return {
             "ok": True,
             "issue_id": issue_id,

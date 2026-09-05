@@ -47,9 +47,31 @@ ApplicationWindow {
             "queued": tr("排队中", "Queued"), "preparing": tr("译前准备", "Preparing"), "translating": tr("翻译中", "Translating"),
             "quality_check": tr("质量检查", "Quality check"), "ready": tr("可以导出", "Ready"), "exporting": tr("正在导出", "Exporting"),
             "completed": tr("已完成", "Completed"), "paused": tr("已暂停", "Paused"), "interrupted": tr("已中断", "Interrupted"),
-            "cancelled": tr("已取消", "Cancelled"), "failed": tr("失败", "Failed")
+            "cancelled": tr("已取消", "Cancelled"), "failed": tr("失败", "Failed"), "pending": tr("待翻译", "Pending"),
+            "translated": tr("已翻译", "Translated"), "needs_review": tr("需要检查", "Needs review")
         }
         return labels[status] || status || tr("未知", "Unknown")
+    }
+
+    function originText(origin) {
+        const labels = {
+            "manual": tr("人工编辑", "Manual edit"), "model_translation": tr("模型翻译", "Model translation"),
+            "retranslation": tr("单段重译", "Retranslation"), "history_restore": tr("历史恢复", "History restore"),
+            "glossary_apply": tr("术语应用", "Glossary update"), "review_accept": tr("采纳审校建议", "Accepted review"),
+            "wenyi_translation": tr("Wenyi 译文", "Wenyi translation"), "wenyi_final": tr("Wenyi 定稿", "Wenyi final"),
+            "wenyi_structure_restore": tr("迁移格式恢复", "Migration structure restore")
+        }
+        return labels[origin] || origin || tr("未知来源", "Unknown origin")
+    }
+
+    function issueStatusText(status) {
+        const labels = {"open":tr("待处理", "Open"), "resolved":tr("已检查", "Reviewed"), "dismissed":tr("已忽略", "Dismissed"), "accepted":tr("已采纳", "Accepted")}
+        return labels[status] || status || ""
+    }
+
+    function requestStatusText(status) {
+        const labels = {"pending":tr("进行中", "Pending"), "succeeded":tr("成功", "Succeeded"), "failed":tr("失败", "Failed"), "aborted":tr("已中止", "Aborted")}
+        return labels[status] || status || ""
     }
 
     function stageText(stage) {
@@ -91,6 +113,65 @@ ApplicationWindow {
         return (value / 3600).toFixed(1) + tr(" 小时", " hr")
     }
 
+    Shortcut {
+        objectName: "shortcutOpen"
+        sequences: [StandardKey.Open]
+        onActivated: importDialog.open()
+    }
+    Shortcut {
+        objectName: "shortcutLibrary"
+        sequence: "Ctrl+1"
+        onActivated: pageIndex = 0
+    }
+    Shortcut {
+        objectName: "shortcutSettings"
+        sequence: "Ctrl+,"
+        onActivated: { pageIndex = 1; doctorResult = backend.doctor() }
+    }
+    Shortcut {
+        objectName: "shortcutRefresh"
+        sequences: ["Ctrl+R", "F5"]
+        onActivated: backend.refresh()
+    }
+    Shortcut {
+        objectName: "shortcutNextTab"
+        sequence: "Ctrl+Tab"
+        enabled: pageIndex === 0 && !!backend.selectedJob.id
+        onActivated: tabs.currentIndex = (tabs.currentIndex + 1) % tabs.count
+    }
+    Shortcut {
+        objectName: "shortcutPreviousTab"
+        sequence: "Ctrl+Shift+Tab"
+        enabled: pageIndex === 0 && !!backend.selectedJob.id
+        onActivated: tabs.currentIndex = (tabs.currentIndex + tabs.count - 1) % tabs.count
+    }
+    Shortcut {
+        objectName: "shortcutZoomIn"
+        sequence: "Ctrl+="
+        onActivated: backend.setUiScale(Math.min(1.5, backend.uiScale + 0.1))
+    }
+    Shortcut {
+        objectName: "shortcutZoomOut"
+        sequence: "Ctrl+-"
+        onActivated: backend.setUiScale(Math.max(0.8, backend.uiScale - 0.1))
+    }
+    Shortcut {
+        objectName: "shortcutResetZoom"
+        sequence: "Ctrl+0"
+        onActivated: backend.setUiScale(1.0)
+    }
+    Shortcut {
+        objectName: "shortcutStartPause"
+        sequence: "Ctrl+Shift+P"
+        enabled: pageIndex === 0 && !!backend.selectedJob.id
+        onActivated: {
+            if (backend.selectedJob.status === "translating" || backend.selectedJob.status === "preparing")
+                backend.pauseJob(backend.selectedJob.id)
+            else if (backend.selectedJob.status !== "completed")
+                backend.startJob(backend.selectedJob.id)
+        }
+    }
+
     FileDialog {
         id: importDialog
         title: tr("选择要翻译的书籍", "Choose a book to translate")
@@ -109,20 +190,20 @@ ApplicationWindow {
         target: backend
         function onMessage(kind, text) {
             toast.kind = kind
-            toast.text = text
+            toast.text = backend.localizeText(text)
             toast.visible = true
             toastTimer.restart()
         }
         function onWorkerEvent(eventType, payloadJson) {
-            if (eventType !== "warning.raised") return
+            if (eventType !== "warning.raised" && eventType !== "operation.failed") return
             let payload = ({})
             try {
                 payload = JSON.parse(payloadJson)
             } catch (error) {
                 payload = ({})
             }
-            toast.kind = "warning"
-            toast.text = payload.message || tr("运行中出现需要注意的情况，请查看日志。", "Something needs attention. See the event log for details.")
+            toast.kind = eventType === "operation.failed" ? "error" : "warning"
+            toast.text = payload.message ? backend.localizeText(payload.message) : (eventType === "operation.failed" ? tr("后台操作失败，请查看任务日志。", "The background operation failed. See the job log for details.") : tr("运行中出现需要注意的情况，请查看日志。", "Something needs attention. See the event log for details."))
             toast.visible = true
             toastTimer.restart()
         }
@@ -197,8 +278,8 @@ ApplicationWindow {
                         id: historyColumn
                         anchors.fill: parent
                         anchors.margins: 12
-                        Label { text: tr("版本 ", "Version ") + modelData.version + " · " + modelData.origin + " · " + modelData.created_at; color: "#aa795d" }
-                        Label { Layout.fillWidth: true; text: modelData.text; wrapMode: Text.Wrap; font.pixelSize: 15 }
+                        Label { text: tr("版本 ", "Version ") + modelData.version + " · " + originText(modelData.origin) + " · " + modelData.created_at; color: "#aa795d" }
+                        Label { Layout.fillWidth: true; text: modelData.display_text; wrapMode: Text.Wrap; font.pixelSize: 15 }
                         RowLayout {
                             Layout.fillWidth: true
                             Button { text: tr("对比", "Compare"); flat: true; onClicked: historyComparison = modelData }
@@ -225,14 +306,14 @@ ApplicationWindow {
                         Layout.fillWidth: true; Layout.fillHeight: true
                         Label { text: tr("历史版本", "Historical version"); font.bold: true }
                         ScrollView { Layout.fillWidth: true; Layout.fillHeight: true
-                            Label { width: parent.width; text: historyComparison.text || ""; wrapMode: Text.Wrap }
+                            Label { width: parent.width; text: historyComparison.display_text || ""; wrapMode: Text.Wrap }
                         }
                     }
                     ColumnLayout {
                         Layout.fillWidth: true; Layout.fillHeight: true
                         Label { text: tr("当前译文", "Current translation"); font.bold: true }
                         ScrollView { Layout.fillWidth: true; Layout.fillHeight: true
-                            Label { width: parent.width; text: historyComparison.current_text || ""; wrapMode: Text.Wrap }
+                            Label { width: parent.width; text: historyComparison.current_display_text || ""; wrapMode: Text.Wrap }
                         }
                     }
                 }
@@ -394,8 +475,8 @@ ApplicationWindow {
                     id: affectedColumn
                     anchors.fill: parent; anchors.margins: 10
                     Label { text: modelData.chapter_title + " · " + tr("段落 ", "Segment ") + (modelData.segment_index + 1); font.bold: true }
-                    Label { Layout.fillWidth: true; text: modelData.source_text; wrapMode: Text.Wrap; opacity: .65 }
-                    Label { Layout.fillWidth: true; text: modelData.target_text || tr("尚未翻译", "Not translated"); wrapMode: Text.Wrap }
+                    Label { Layout.fillWidth: true; text: modelData.source_display_text; wrapMode: Text.Wrap; opacity: .65 }
+                    Label { Layout.fillWidth: true; text: modelData.target_display_text || tr("尚未翻译", "Not translated"); wrapMode: Text.Wrap }
                 }
             }
         }
@@ -596,9 +677,12 @@ ApplicationWindow {
                 }
 
                 Button {
+                    objectName: "navImportButton"
                     Layout.fillWidth: true
                     text: "+  " + backend.t("import_book")
                     highlighted: true
+                    ToolTip.visible: hovered
+                    ToolTip.text: tr("导入书籍（Ctrl+O）", "Import book (Ctrl+O)")
                     onClicked: importDialog.open()
                 }
 
@@ -625,6 +709,7 @@ ApplicationWindow {
                             onClicked: {
                                 pageIndex = 0
                                 detailTab = backend.detailTab(modelData.id)
+                                glossaryQuery = ""
                                 backend.selectJob(modelData.id)
                                 Qt.callLater(function() {
                                     segmentList.contentY = backend.editorPosition(backend.selectedJob.id, backend.selectedChapterId)
@@ -664,9 +749,12 @@ ApplicationWindow {
                 ToolSeparator { Layout.fillWidth: true; orientation: Qt.Horizontal }
 
                 Button {
+                    objectName: "navSettingsButton"
                     Layout.fillWidth: true
                     flat: pageIndex !== 1
                     text: backend.t("settings")
+                    ToolTip.visible: hovered
+                    ToolTip.text: tr("设置（Ctrl+,）", "Settings (Ctrl+,)")
                     onClicked: { pageIndex = 1; doctorResult = backend.doctor() }
                 }
                 Label { text: "v0.1.0 · Windows"; opacity: .38; font.pixelSize: 11; Layout.alignment: Qt.AlignHCenter }
@@ -717,6 +805,7 @@ ApplicationWindow {
                             Label { text: (backend.selectedJob.author || tr("作者未知", "Unknown author")) + " · " + (backend.selectedJob.source_format || "").toUpperCase() + " · " + statusText(backend.selectedJob.status); opacity: .58 }
                         }
                         Button {
+                            objectName: "startJobButton"
                             text: backend.selectedJob.status === "paused" || backend.selectedJob.status === "failed" || backend.selectedJob.status === "interrupted" ? tr("继续翻译", "Continue") : tr("开始翻译", "Start")
                             highlighted: true
                             enabled: backend.selectedJob.status !== "translating" && backend.selectedJob.status !== "preparing" && backend.selectedJob.status !== "completed"
@@ -728,6 +817,7 @@ ApplicationWindow {
                             onClicked: { newJobId = backend.selectedJob.id; newJobDialog.open() }
                         }
                         Button {
+                            objectName: "pauseJobButton"
                             text: tr("安全暂停", "Pause safely")
                             enabled: backend.selectedJob.status === "translating" || backend.selectedJob.status === "preparing"
                             onClicked: backend.pauseJob(backend.selectedJob.id)
@@ -738,11 +828,18 @@ ApplicationWindow {
                             enabled: backend.selectedJob.status !== "translating" && backend.selectedJob.status !== "preparing" && backend.selectedJob.status !== "quality_check" && backend.selectedJob.status !== "exporting"
                             onClicked: backend.archiveJob(backend.selectedJob.id)
                         }
-                        RoundButton { text: "↻"; onClicked: backend.refresh() }
+                        RoundButton {
+                            objectName: "refreshButton"
+                            text: "↻"
+                            ToolTip.visible: hovered
+                            ToolTip.text: tr("刷新（Ctrl+R 或 F5）", "Refresh (Ctrl+R or F5)")
+                            onClicked: backend.refresh()
+                        }
                     }
 
                     TabBar {
                         id: tabs
+                        objectName: "detailTabs"
                         Layout.fillWidth: true
                         currentIndex: detailTab
                         onCurrentIndexChanged: {
@@ -751,7 +848,7 @@ ApplicationWindow {
                         }
                         TabButton { text: backend.t("overview") }
                         TabButton { text: backend.t("editor") }
-                        TabButton { text: backend.t("glossary") + "  " + backend.glossary.length }
+                        TabButton { text: backend.t("glossary") + "  " + backend.glossaryTotal }
                         TabButton { text: backend.t("quality") + "  " + backend.issues.length }
                         TabButton { text: backend.t("usage") }
                         TabButton { text: backend.t("outputs") }
@@ -759,6 +856,7 @@ ApplicationWindow {
                     }
 
                     StackLayout {
+                        objectName: "detailPages"
                         Layout.fillWidth: true
                         Layout.fillHeight: true
                         currentIndex: detailTab
@@ -806,9 +904,9 @@ ApplicationWindow {
                                         ProgressBar { Layout.fillWidth: true; from: 0; to: Math.max(1, Number(backend.selectedJob.total_segments || 0)); value: Number(backend.selectedJob.completed_segments || 0) }
                                         RowLayout {
                                             Layout.fillWidth: true
-                                            Label { text: backend.selectedJob.current_message || tr("任务已经导入，等待开始", "Imported and waiting to start"); opacity: .6; Layout.fillWidth: true }
+                                            Label { text: backend.selectedJob.display_message || tr("任务已经导入，等待开始", "Imported and waiting to start"); opacity: .6; Layout.fillWidth: true }
                                             Label {
-                                                visible: Number(backend.selectedJob.segments_per_minute || 0) > 0
+                                                visible: backend.selectedJob.status === "translating" && Number(backend.selectedJob.segments_per_minute || 0) > 0
                                                 text: Number(backend.selectedJob.segments_per_minute).toFixed(1) + tr(" 段/分钟 · 预计剩余 ", " segments/min · ETA ") + durationText(backend.selectedJob.eta_seconds)
                                                 opacity: .6
                                             }
@@ -816,7 +914,7 @@ ApplicationWindow {
                                     }
                                 }
                                 Rectangle {
-                                    visible: backend.selectedJob.warnings && backend.selectedJob.warnings.length > 0
+                                    visible: !!(backend.selectedJob.warnings && backend.selectedJob.warnings.length > 0)
                                     Layout.fillWidth: true
                                     Layout.preferredHeight: visible ? warningColumn.implicitHeight + 30 : 0
                                     radius: 12
@@ -833,13 +931,13 @@ ApplicationWindow {
                                                 required property var modelData
                                                 Layout.fillWidth: true
                                                 wrapMode: Text.Wrap
-                                                text: "• " + (typeof modelData === "string" ? modelData : (modelData.message || JSON.stringify(modelData)))
+                                                text: "• " + backend.localizeText(typeof modelData === "string" ? modelData : (modelData.message || JSON.stringify(modelData)))
                                             }
                                         }
                                     }
                                 }
                                 Rectangle {
-                                    visible: backend.selectedJob.book_context && backend.selectedJob.book_context.overview
+                                    visible: !!(backend.selectedJob.book_context && backend.selectedJob.book_context.overview)
                                     Layout.fillWidth: true
                                     Layout.preferredHeight: visible ? contextColumn.implicitHeight + 30 : 0
                                     radius: 12
@@ -852,16 +950,16 @@ ApplicationWindow {
                                         Label { text: tr("全书理解", "Book context"); font.bold: true; font.pixelSize: 18 }
                                         Label { Layout.fillWidth: true; text: backend.selectedJob.book_context ? (backend.selectedJob.book_context.overview || "") : ""; wrapMode: Text.Wrap }
                                         Label {
-                                            visible: backend.selectedJob.book_context && backend.selectedJob.book_context.style
+                                            visible: !!(backend.selectedJob.book_context && backend.selectedJob.book_context.style)
                                             Layout.fillWidth: true
-                                            text: tr("文体：", "Style: ") + (backend.selectedJob.book_context.style || "")
+                                            text: tr("文体：", "Style: ") + (backend.selectedJob.book_context ? (backend.selectedJob.book_context.style || "") : "")
                                             wrapMode: Text.Wrap
                                             opacity: .65
                                         }
                                         Label {
-                                            visible: backend.selectedJob.book_context && backend.selectedJob.book_context.characters && backend.selectedJob.book_context.characters.length > 0
+                                            visible: !!(backend.selectedJob.book_context && backend.selectedJob.book_context.characters && Object.keys(backend.selectedJob.book_context.characters).length > 0)
                                             Layout.fillWidth: true
-                                            text: tr("人物与关系：", "Characters and relationships: ") + JSON.stringify(backend.selectedJob.book_context.characters)
+                                            text: tr("人物与关系：", "Characters and relationships: ") + JSON.stringify(backend.selectedJob.book_context ? (backend.selectedJob.book_context.characters || []) : [])
                                             wrapMode: Text.Wrap
                                             opacity: .65
                                         }
@@ -880,7 +978,7 @@ ApplicationWindow {
                                             Label { text: modelData.status === "done" ? "✓" : modelData.status === "running" ? "●" : "○"; color: modelData.status === "done" ? "#4d9b69" : "#c86a3b"; font.pixelSize: 18 }
                                             Label { text: stageText(modelData.name); font.bold: true; Layout.preferredWidth: 130 }
                                             ProgressBar { Layout.fillWidth: true; from: 0; to: Math.max(1, modelData.total); value: modelData.completed }
-                                            Label { text: modelData.message || (modelData.completed + "/" + modelData.total); opacity: .55; Layout.preferredWidth: 260; elide: Text.ElideRight }
+                                            Label { text: modelData.display_message || (modelData.completed + "/" + modelData.total); opacity: .55; Layout.preferredWidth: 260; elide: Text.ElideRight }
                                         }
                                     }
                                 }
@@ -888,7 +986,9 @@ ApplicationWindow {
                         }
 
                         Item {
+                            objectName: "editorPage"
                             RowLayout {
+                                objectName: "editorLayout"
                                 anchors.fill: parent
                                 spacing: 14
                                 Rectangle {
@@ -918,8 +1018,12 @@ ApplicationWindow {
                                 }
                                 ListView {
                                     id: segmentList
+                                    objectName: "segmentList"
                                     Layout.fillWidth: true
                                     Layout.fillHeight: true
+                                    Layout.minimumWidth: 360
+                                    Layout.minimumHeight: 300
+                                    cacheBuffer: 480
                                     clip: true
                                     spacing: 12
                                     model: backend.segments
@@ -930,6 +1034,7 @@ ApplicationWindow {
                                         onTriggered: backend.saveEditorPosition(backend.selectedJob.id, backend.selectedChapterId, segmentList.contentY)
                                     }
                                     delegate: Rectangle {
+                                        objectName: "segmentDelegate"
                                         required property var modelData
                                         property int editVersion: modelData.version
                                         property bool manuallyLocked: modelData.locked
@@ -943,14 +1048,19 @@ ApplicationWindow {
                                             RowLayout {
                                                 Layout.fillWidth: true
                                                 Label { text: tr("段落 ", "Segment ") + (modelData.segment_index + 1); font.bold: true; color: "#c86a3b" }
-                                                Label { text: manuallyLocked ? tr("人工锁定", "Manually locked") : statusText(modelData.status); opacity: .55 }
+                                                Label {
+                                                    objectName: "segmentStatusLabel"
+                                                    property string segmentId: modelData.id
+                                                    text: manuallyLocked ? tr("人工锁定", "Manually locked") : statusText(modelData.status)
+                                                    opacity: .55
+                                                }
                                                 Item { Layout.fillWidth: true }
                                                 ToolButton { text: tr("撤销", "Undo"); enabled: targetEdit.canUndo; onClicked: targetEdit.undo() }
                                                 ToolButton { text: tr("恢复", "Redo"); enabled: targetEdit.canRedo; onClicked: targetEdit.redo() }
                                                 ToolButton { text: tr("历史", "History"); onClicked: { historySegment = modelData.id; backend.segmentHistory(modelData.id) } }
                                                 ToolButton {
                                                     text: tr("重译", "Retranslate")
-                                                    enabled: modelData.target_text.length > 0
+                                                    enabled: modelData.target_display_text.length > 0
                                                     onClicked: {
                                                         retranslateSegmentId = modelData.id
                                                         retranslateInstruction.clear()
@@ -967,7 +1077,15 @@ ApplicationWindow {
                                                     Layout.fillWidth: true; Layout.fillHeight: true; radius: 8
                                                     color: darkMode ? "#1d1a18" : "#f4f0e9"
                                                     ScrollView { anchors.fill: parent; anchors.margins: 10
-                                                        Label { width: parent.width; text: modelData.source_text; wrapMode: Text.Wrap; font.pixelSize: 15; lineHeight: 1.4 }
+                                                        Label {
+                                                            objectName: "sourceTextLabel"
+                                                            property string segmentId: modelData.id
+                                                            width: parent.width
+                                                            text: modelData.source_display_text
+                                                            wrapMode: Text.Wrap
+                                                            font.pixelSize: 15
+                                                            lineHeight: 1.4
+                                                        }
                                                     }
                                                 }
                                                 Rectangle {
@@ -976,23 +1094,39 @@ ApplicationWindow {
                                                     ScrollView { anchors.fill: parent; anchors.margins: 5
                                                         TextArea {
                                                             id: targetEdit
-                                                            text: modelData.target_text
+                                                            objectName: "translationEditor"
+                                                            property string segmentId: modelData.id
+                                                            text: modelData.target_display_text
                                                             placeholderText: tr("译文尚未生成", "Translation not generated")
                                                             wrapMode: TextEdit.Wrap
                                                             font.pixelSize: 15
                                                             background: null
                                                             selectByMouse: true
                                                             onTextChanged: if (activeFocus) saveTimer.restart()
+                                                            onActiveFocusChanged: {
+                                                                if (!activeFocus && saveTimer.running) {
+                                                                    saveTimer.stop()
+                                                                    saveNow()
+                                                                }
+                                                            }
+                                                            function saveNow() {
+                                                                let savedVersion = backend.saveSegment(modelData.id, targetEdit.text, editVersion)
+                                                                if (savedVersion > editVersion) {
+                                                                    editVersion = savedVersion
+                                                                    manuallyLocked = true
+                                                                }
+                                                            }
+                                                            Keys.onPressed: function(event) {
+                                                                if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_S) {
+                                                                    saveTimer.stop()
+                                                                    saveNow()
+                                                                    event.accepted = true
+                                                                }
+                                                            }
                                                             Timer {
                                                                 id: saveTimer
                                                                 interval: 600
-                                                                onTriggered: {
-                                                                    let savedVersion = backend.saveSegment(modelData.id, targetEdit.text, editVersion)
-                                                                    if (savedVersion > editVersion) {
-                                                                        editVersion = savedVersion
-                                                                        manuallyLocked = true
-                                                                    }
-                                                                }
+                                                                onTriggered: targetEdit.saveNow()
                                                             }
                                                         }
                                                     }
@@ -1004,10 +1138,9 @@ ApplicationWindow {
                             }
                         }
 
-                        ScrollView {
-                            contentWidth: availableWidth
+                        Item {
                             ColumnLayout {
-                                width: parent.width
+                                anchors.fill: parent
                                 spacing: 10
                                 RowLayout {
                                     Layout.fillWidth: true
@@ -1015,22 +1148,35 @@ ApplicationWindow {
                                     Item { Layout.fillWidth: true }
                                     TextField {
                                         Layout.preferredWidth: 240
+                                        text: glossaryQuery
                                         placeholderText: tr("搜索原词或译名", "Search source or translation")
-                                        onTextChanged: glossaryQuery = text.trim().toLowerCase()
+                                        onTextChanged: {
+                                            glossaryQuery = text.trim()
+                                            glossarySearchTimer.restart()
+                                        }
                                     }
+                                    Timer { id: glossarySearchTimer; interval: 250; onTriggered: backend.searchGlossary(glossaryQuery) }
                                     Label { text: tr("当前冻结版本 ", "Frozen version ") + (backend.selectedJob.glossary_snapshot_version || 0); opacity: .5 }
+                                    Label { text: tr("显示 ", "Showing ") + backend.glossary.length + " / " + backend.glossaryTotal; opacity: .5 }
                                     Button { text: tr("刷新冻结版本", "Refresh snapshot"); onClicked: backend.refreshGlossarySnapshot(backend.selectedJob.id) }
                                 }
-                                Repeater {
-                                    model: backend.glossary.filter(function(term) {
-                                        if (!glossaryQuery.length) return true
-                                        return String(term.source || "").toLowerCase().includes(glossaryQuery)
-                                            || String(term.target || "").toLowerCase().includes(glossaryQuery)
-                                            || (term.alternatives || []).some(function(value) { return String(value).toLowerCase().includes(glossaryQuery) })
-                                    })
-                                    Rectangle {
+                                ListView {
+                                    id: glossaryList
+                                    objectName: "glossaryList"
+                                    Layout.fillWidth: true
+                                    Layout.fillHeight: true
+                                    clip: true
+                                    spacing: 8
+                                    model: backend.glossary
+                                    onContentYChanged: {
+                                        if (contentY + height >= contentHeight - 240)
+                                            backend.loadMoreGlossary()
+                                    }
+                                    delegate: Rectangle {
                                         required property var modelData
-                                        Layout.fillWidth: true; Layout.preferredHeight: modelData.status === "conflict" ? 108 : 76; radius: 10
+                                        width: ListView.view.width
+                                        height: modelData.status === "conflict" ? 108 : 76
+                                        radius: 10
                                         color: darkMode ? "#24211e" : "#fffdf9"
                                         border.color: modelData.status === "conflict" ? "#d38b43" : (darkMode ? "#39332e" : "#e5ddd2")
                                         ColumnLayout { anchors.fill: parent; anchors.margins: 12; spacing: 4
@@ -1065,7 +1211,7 @@ ApplicationWindow {
                                         }
                                     }
                                 }
-                                Label { visible: backend.glossary.length === 0; text: tr("译前准备完成后，这里会显示真正影响全书一致性的术语。", "Terms that affect book-wide consistency appear here after preparation."); opacity: .55 }
+                                Label { visible: backend.glossaryTotal === 0; text: tr("译前准备完成后，这里会显示真正影响全书一致性的术语。", "Terms that affect book-wide consistency appear here after preparation."); opacity: .55 }
                             }
                         }
 
@@ -1100,7 +1246,7 @@ ApplicationWindow {
                                                 Label { Layout.fillWidth: true; text: modelData.message; wrapMode: Text.Wrap }
                                                 Label { visible: !!modelData.suggestion; Layout.fillWidth: true; text: tr("建议：", "Suggestion: ") + modelData.suggestion; wrapMode: Text.Wrap; opacity: .7 }
                                             }
-                                             Label { text: modelData.status; opacity: .5 }
+                                             Label { text: issueStatusText(modelData.status); opacity: .5 }
                                              Button {
                                                  visible: modelData.status === "open" && modelData.suggestion
                                                  text: tr("编辑并应用", "Edit and apply")
@@ -1182,7 +1328,7 @@ ApplicationWindow {
                                             Label { text: modelData.chapter_title || tr("全书任务", "Whole-book task"); Layout.fillWidth: true; elide: Text.ElideRight }
                                             Label { text: modelData.model; Layout.preferredWidth: 170; elide: Text.ElideRight }
                                             Label { text: tr("尝试 ", "Attempt ") + modelData.attempt; Layout.preferredWidth: 65 }
-                                            Label { text: modelData.status; Layout.preferredWidth: 80 }
+                                            Label { text: requestStatusText(modelData.status); Layout.preferredWidth: 80 }
                                             Label { text: (modelData.prompt_tokens + modelData.completion_tokens) + " tok"; Layout.preferredWidth: 100 }
                                         }
                                     }
@@ -1263,7 +1409,7 @@ ApplicationWindow {
                                             Label {
                                                 visible: expanded
                                                 Layout.fillWidth: true
-                                                text: JSON.stringify(modelData.payload, null, 2)
+                                                text: JSON.stringify(modelData.display_payload || modelData.payload, null, 2)
                                                 wrapMode: Text.WrapAnywhere
                                                 opacity: .65
                                                 font.family: "Consolas"
