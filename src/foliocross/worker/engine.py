@@ -20,7 +20,12 @@ from ..errors import FolioCrossError
 from ..infrastructure.formats.common import batches
 from ..infrastructure.formats.exporters import export_job
 from ..infrastructure.formats.markers import repair_missing_markers, validate_markers
-from ..infrastructure.llm import FakeClient, OpenAICompatibleClient, parse_json_content
+from ..infrastructure.llm import (
+    FakeClient,
+    OpenAICompatibleClient,
+    is_transport_error,
+    parse_json_content,
+)
 from ..infrastructure.pricing import calculate_cost
 from ..infrastructure.repository import Repository
 from ..infrastructure.workspace import Workspace
@@ -43,10 +48,14 @@ class AdaptiveLimiter:
         self.condition = threading.Condition()
 
     @contextmanager
-    def slot(self) -> Iterator[None]:
+    def slot(self, check_control: Callable[[], None] | None = None) -> Iterator[None]:
         with self.condition:
             while self.active >= self.limit:
+                if check_control is not None:
+                    check_control()
                 self.condition.wait(timeout=0.5)
+            if check_control is not None:
+                check_control()
             self.active += 1
         try:
             yield
@@ -278,36 +287,22 @@ class LLMRuntime:
         last_error: Exception | None = None
         for attempt in range(1, self.config.max_retries + 2):
             self.check_control()
-            self.gate.wait(max(1, len(system + user) // 3), self.check_control)
-            request_id = self.repository.start_request(
-                self.job_id,
-                stage=stage,
-                model=model,
-                input_hash=input_hash,
-                chapter_id=chapter_id,
-                attempt=attempt,
-            )
-            response = None
-            cost = None
             try:
-                with self.limiter.slot():
-                    response = self.client.complete(
+                # Keep the slot until usage is committed, so the next queued
+                # caller checks the budget including this completed request.
+                with self.limiter.slot(self.check_control):
+                    self.gate.wait(max(1, len(system + user) // 3), self.check_control)
+                    self.check_control()
+                    response, cost, parsed = self._dispatch_json(
+                        stage=stage,
                         model=model,
                         system=system,
                         user=user,
-                        json_mode=True,
+                        input_hash=input_hash,
+                        chapter_id=chapter_id,
+                        attempt=attempt,
                         max_tokens=max_tokens,
                     )
-                cost = self._cost(response.usage)
-                parsed = parse_json_content(response.content)
-                self.repository.finish_request(
-                    request_id,
-                    status="succeeded",
-                    prompt_tokens=response.usage.prompt_tokens,
-                    completion_tokens=response.usage.completion_tokens,
-                    cache_hit_tokens=response.usage.cache_hit_tokens,
-                    cost=cost,
-                )
                 limit = self.limiter.success()
                 self.emitter.emit(
                     self.job_id,
@@ -326,34 +321,23 @@ class LLMRuntime:
                 )
                 return parsed
             except (PauseRequested, CancelRequested):
-                self.repository.finish_request(
-                    request_id, status="aborted", error_code="controlled_stop"
-                )
                 raise
             except Exception as error:
                 last_error = error
                 status_code = getattr(error, "status_code", None)
                 code = getattr(error, "code", None) or type(error).__name__
-                if response is None:
-                    self.repository.finish_request(
-                        request_id, status="failed", error_code=str(code)
-                    )
-                else:
-                    self.repository.finish_request(
-                        request_id,
-                        status="failed",
-                        prompt_tokens=response.usage.prompt_tokens,
-                        completion_tokens=response.usage.completion_tokens,
-                        cache_hit_tokens=response.usage.cache_hit_tokens,
-                        cost=cost,
-                        error_code=str(code),
-                    )
-                retryable = status_code in {408, 409, 429, 500, 502, 503, 504} or isinstance(
-                    error, (TimeoutError, ConnectionError)
-                )
+                retryable = status_code in {
+                    408,
+                    409,
+                    429,
+                    500,
+                    502,
+                    503,
+                    504,
+                } or is_transport_error(error)
                 if code in {"invalid_json", "empty_response"}:
                     retryable = True
-                if status_code == 429 or "429" in str(error):
+                if status_code == 429:
                     limit = self.limiter.rate_limited()
                     self.emitter.emit(
                         self.job_id,
@@ -385,6 +369,60 @@ class LLMRuntime:
                 self._controlled_wait(delay)
         assert last_error is not None
         raise last_error
+
+    def _dispatch_json(
+        self,
+        *,
+        stage,
+        model,
+        system,
+        user,
+        input_hash,
+        chapter_id,
+        attempt,
+        max_tokens,
+    ):
+        request_id = self.repository.start_request(
+            self.job_id,
+            stage=stage,
+            model=model,
+            input_hash=input_hash,
+            chapter_id=chapter_id,
+            attempt=attempt,
+        )
+        response = None
+        cost = None
+        try:
+            response = self.client.complete(
+                model=model,
+                system=system,
+                user=user,
+                json_mode=True,
+                max_tokens=max_tokens,
+            )
+            cost = self._cost(response.usage)
+            parsed = parse_json_content(response.content)
+        except Exception as error:
+            usage = response.usage if response else None
+            self.repository.finish_request(
+                request_id,
+                status="failed",
+                prompt_tokens=usage.prompt_tokens if usage else 0,
+                completion_tokens=usage.completion_tokens if usage else 0,
+                cache_hit_tokens=usage.cache_hit_tokens if usage else 0,
+                cost=cost,
+                error_code=str(getattr(error, "code", None) or type(error).__name__),
+            )
+            raise
+        self.repository.finish_request(
+            request_id,
+            status="succeeded",
+            prompt_tokens=response.usage.prompt_tokens,
+            completion_tokens=response.usage.completion_tokens,
+            cache_hit_tokens=response.usage.cache_hit_tokens,
+            cost=cost,
+        )
+        return response, cost, parsed
 
     def _controlled_wait(self, delay: float) -> None:
         deadline = time.monotonic() + delay
@@ -418,8 +456,29 @@ class WorkerEngine:
         self.repository = Repository(self.workspace)
         self.emitter = WorkerEventEmitter(self.repository, event_sink)
 
+    def update_glossary(self, job_id, source, target, *, apply_existing=False, freeze=False):
+        from ..application.service import FolioCrossService
+
+        with job_lock(self.workspace, job_id):
+            service = FolioCrossService(self.workspace)
+            if freeze:
+                result = service.refresh_glossary_snapshot(job_id)
+            else:
+                result = service.update_glossary(
+                    job_id, source, target, apply_existing=apply_existing
+                )
+            self.emitter.emit(
+                job_id,
+                "glossary.updated",
+                {"applied_segments": result.get("applied_segments", 0), "frozen": freeze},
+            )
+            return result
+
     def run(self, job_id: str, *, export_when_done: bool = True) -> dict[str, Any]:
         with job_lock(self.workspace, job_id):
+            from ..infrastructure.content_upgrade import ensure_html_coverage
+
+            ensure_html_coverage(self.repository, job_id)
             job = self.repository.get_job(job_id)
             config = JobConfig.from_dict(job["config"])
             runtime = LLMRuntime(self.repository, job_id, config, self.emitter)
@@ -744,10 +803,9 @@ class WorkerEngine:
             )
             succeeded = False
             try:
-                output = export_job(self.repository, job_id, format_name, output_path)
-                artifact_id = self.repository.add_artifact(
-                    job_id, kind="translation", format_name=format_name, path=output
-                )
+                published = export_job(self.repository, job_id, format_name, output_path)
+                output = published["path"]
+                artifact_id = published["artifact_id"]
                 self.emitter.emit(
                     job_id, "export.completed", {"format": format_name, "output": output}
                 )
@@ -1123,10 +1181,7 @@ class WorkerEngine:
         )
         self.repository.update_step(job_id, "export", status="running")
         self.emitter.emit(job_id, "stage.changed", {"stage": "export", "message": "正在生成成品"})
-        output = export_job(self.repository, job_id, config.output_format)
-        self.repository.add_artifact(
-            job_id, kind="translation", format_name=config.output_format, path=output
-        )
+        output = export_job(self.repository, job_id, config.output_format)["path"]
         self.repository.update_step(
             job_id, "export", status="done", completed=1, total=1, message=output
         )

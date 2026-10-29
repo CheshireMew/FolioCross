@@ -238,7 +238,12 @@ def test_background_worker_modes(cli, tmp_path, monkeypatch):
     output = tmp_path / "后台导出.txt"
     exported = execute("export", job, "--format", "txt", "--output", output)
     assert output.is_file()
-    assert any(a["path"] == str(output) for a in exported["artifacts"])
+    version = next(
+        a
+        for a in exported["artifacts"]
+        if a.get("metadata", {}).get("delivery_path") == str(output)
+    )
+    assert Path(version["path"]).read_bytes() == output.read_bytes()
 
 
 def test_background_retranslation_rejects_edit_after_submission(cli, tmp_path, monkeypatch):

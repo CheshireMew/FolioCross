@@ -6,15 +6,25 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 from ...domain.models import ChapterDraft, ParsedBook, SegmentDraft
 from ...errors import FolioCrossError
 from .markers import MARKER_PATTERN, replace_block_contents, serialize_block
 
-BLOCK_SELECTOR = "h1,h2,h3,h4,h5,h6,p,li,blockquote,figcaption,td,th"
+BLOCK_SELECTOR = (
+    "h1,h2,h3,h4,h5,h6,p,li,blockquote,figcaption,td,th,pre,"
+    "div,section,article,main,aside,header,footer,nav,figure,body,details,summary"
+)
 BLOCK_NAMES = set(BLOCK_SELECTOR.split(","))
 DIRECT_BLOCK_ATTR = "data-foliocross-direct"
+
+
+def _non_prose(node) -> bool:
+    return isinstance(node, Comment) or (
+        isinstance(node, Tag)
+        and (node.name in {"script", "style", "template"} or node.has_attr("hidden"))
+    )
 
 
 def _wrap_direct_content(soup: BeautifulSoup, candidates: list[Tag]) -> None:
@@ -44,7 +54,7 @@ def _wrap_direct_content(soup: BeautifulSoup, candidates: list[Tag]) -> None:
             contains_block = isinstance(child, Tag) and (
                 child.name in BLOCK_NAMES or child.select_one(BLOCK_SELECTOR)
             )
-            if contains_block:
+            if contains_block or _non_prose(child):
                 flush()
             else:
                 group.append(child)
@@ -52,23 +62,21 @@ def _wrap_direct_content(soup: BeautifulSoup, candidates: list[Tag]) -> None:
 
 
 def content_blocks(soup: BeautifulSoup) -> list[Tag]:
-    candidates = [item for item in soup.select(BLOCK_SELECTOR) if isinstance(item, Tag)]
+    candidates = [
+        item
+        for item in soup.select(BLOCK_SELECTOR)
+        if isinstance(item, Tag) and not any(_non_prose(node) for node in [item, *item.parents])
+    ]
     _wrap_direct_content(soup, candidates)
     candidates = [
         item
         for item in soup.select(f"{BLOCK_SELECTOR},span[{DIRECT_BLOCK_ATTR}]")
-        if isinstance(item, Tag)
+        if isinstance(item, Tag) and not any(_non_prose(node) for node in [item, *item.parents])
     ]
     # A blockquote, list item or table cell often contains paragraph blocks. Translating
     # both the parent and the child duplicates the same prose and breaks template mapping.
     blocks = [item for item in candidates if not item.select_one(BLOCK_SELECTOR)]
-    if blocks:
-        return blocks
-    return [
-        item
-        for item in soup.find_all(["div", "section"])
-        if isinstance(item, Tag) and not item.find(["div", "section", "p"])
-    ]
+    return blocks
 
 
 def remove_internal_wrappers(soup: BeautifulSoup) -> None:
@@ -91,12 +99,17 @@ def extract_html_chapter(
         visible = MARKER_PATTERN.sub("", text).strip()
         if not visible:
             continue
-        if not title and block.name and block.name.lower().startswith("h"):
+        if not title and block.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
             title = block.get_text(" ", strip=True)
         segments.append(
             SegmentDraft(
                 source_text=text,
-                locator={"resource": resource, "ordinal": ordinal, "tag": block.name},
+                locator={
+                    "resource": resource,
+                    "ordinal": ordinal,
+                    "tag": block.name,
+                    "extraction_version": 2,
+                },
                 markers=markers,
             )
         )
@@ -113,7 +126,14 @@ def parse_html(path: str, source_lang: str = "auto") -> ParsedBook:
         raise ValueError("HTML 中没有可翻译正文")
     title_node = soup.find("title") or soup.find("h1")
     title = title_node.get_text(" ", strip=True) if title_node else Path(path).stem
-    return ParsedBook(title, "", "html", source_lang, [chapter], {"html_resource": Path(path).name})
+    return ParsedBook(
+        title,
+        "",
+        "html",
+        source_lang,
+        [chapter],
+        {"html_resource": Path(path).name, "extraction_version": 2},
+    )
 
 
 def fill_html_template(
@@ -136,7 +156,10 @@ def fill_html_template(
         target = "".join(item["target_text"] or item["source_text"] for item in parts)
         source = "".join(item["source_text"] for item in parts)
         fresh_source, _ = serialize_block(
-            blocks[ordinal], identity=f"{Path(source_path).name}:{ordinal}"
+            blocks[ordinal],
+            identity=parts[0]["locator"].get(
+                "marker_identity", f"{Path(source_path).name}:{ordinal}"
+            ),
         )
         if fresh_source != source:
             raise FolioCrossError(

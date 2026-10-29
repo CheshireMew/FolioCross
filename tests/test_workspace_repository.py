@@ -32,7 +32,7 @@ def test_workspace_schema_and_wal(workspace):
     with workspace.connect() as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
         versions = [row[0] for row in connection.execute("SELECT version FROM schema_migrations")]
-    assert versions == [1, 2, 3, 4, 5]
+    assert versions == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
 def test_import_creates_uuid_book_job_and_segments(workspace, tmp_path: Path):

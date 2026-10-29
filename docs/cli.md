@@ -103,8 +103,10 @@ foliocross revisions restore <revision-id> --expected-version 4 --json
 `glossary refresh JOB` 才更新冻结版本。它不会自动批量修改已有译文。
 
 `export JOB --format txt --output "E:\Books\translation.txt" [--background]` 支持指定导出路径，
-未指定格式时使用任务配置。同步结果含 `path`、`artifact_id`；后台完成后从操作查询的 `artifacts`
-中读取产物。指定已有输出路径会按现有导出器行为覆盖该文件。编辑后请重新导出以更新文件。
+未指定格式时使用任务配置。同步结果含 `path`（交付位置）、`artifact_path`（工作区保留版本）和
+`artifact_id`；后台完成后从操作查询的 `artifacts` 中读取保留版本，其 `metadata.delivery_path`
+记录交付位置。每次导出保留独立版本，指定已有交付路径时会在新文件写入成功后原子替换该副本。
+编辑后请重新导出以更新文件。
 
 离线验证可用 `import ... --fake`，不会消耗模型费用。真实翻译、审校和重译使用任务的模型配置；
 `doctor --live-model` 会发起一次真实连接检查。密钥仍来自 Windows 凭据管理器或环境变量。

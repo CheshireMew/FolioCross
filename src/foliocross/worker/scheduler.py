@@ -129,6 +129,19 @@ def _worker_arguments(operation: dict) -> list[str]:
         result.extend(["--export-format", str(arguments["format_name"])])
         if arguments.get("output_path"):
             result.extend(["--output", str(arguments["output_path"])])
+    elif action == "glossary":
+        result.extend(
+            [
+                "--glossary-source",
+                str(arguments["source"]),
+                "--glossary-target",
+                str(arguments["target"]),
+            ]
+        )
+        if arguments.get("apply_existing"):
+            result.append("--apply-existing")
+    elif action == "freeze_glossary":
+        result.append("--freeze-glossary")
     elif action != "run":
         raise ValueError(f"Unsupported operation action: {action}")
     if action == "run" and arguments.get("no_export"):

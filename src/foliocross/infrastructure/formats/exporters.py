@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 import zipfile
 from pathlib import Path
@@ -10,6 +11,7 @@ from pathlib import Path
 from docx import Document
 
 from ...errors import FolioCrossError
+from ..repository import new_id
 from .docx import export_docx_template
 from .epub import export_epub_template
 from .htmlish import fill_html_template
@@ -174,7 +176,55 @@ def _write_generated_epub(
 
 def export_job(
     repository, job_id: str, format_name: str | None = None, output_path: str | None = None
-) -> str:
+) -> dict:
+    from ..artifact_publication import publish_export
+
+    job = repository.get_job(job_id)
+    format_name = (format_name or job["config"].get("output_format") or "epub").lower()
+    if format_name == "md":
+        format_name = "markdown"
+    if format_name not in SUPPORTED_OUTPUTS:
+        raise FolioCrossError("unsupported_output", f"不支持输出格式：{format_name}")
+    publication_id = new_id()
+    suffix = ".md" if format_name == "markdown" else f".{format_name}"
+    output_dir = repository.workspace.book_export_dir(job["book_id"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    artifact = output_dir / f"{_safe_name(job['title'])}.zh-CN-{publication_id}{suffix}"
+    stage = artifact.with_name(f".{publication_id}.partial{suffix}")
+    _render_job(repository, job_id, format_name, str(stage))
+    if format_name in {"epub", "docx"}:
+        with zipfile.ZipFile(stage) as archive:
+            if archive.testzip() is not None:
+                raise ValueError("导出归档校验失败，未替换已有成品。")
+    with stage.open("rb+") as stream:
+        os.fsync(stream.fileno())
+    delivery = Path(output_path).resolve() if output_path else artifact
+    book = repository.get_book(job["book_id"])
+    if delivery in {Path(book["stored_source_path"]), Path(book["working_source_path"])}:
+        raise FolioCrossError("export_overwrites_source", "导出位置不能覆盖工作区源书。")
+    if any(
+        Path(item["path"]) == delivery
+        for item in repository.list_artifacts(job_id)
+        if item["kind"] == "translation"
+    ):
+        raise FolioCrossError(
+            "export_overwrites_version", "导出位置不能覆盖已有成品版本，请选择另一个位置。"
+        )
+    return publish_export(
+        repository,
+        publication_id=publication_id,
+        job_id=job_id,
+        format_name=format_name,
+        stage=stage,
+        artifact=artifact,
+        delivery=delivery,
+    )
+
+
+def _render_job(repository, job_id: str, format_name: str, output_path: str) -> str:
+    from ..content_upgrade import ensure_html_coverage
+
+    ensure_html_coverage(repository, job_id)
     job = repository.get_job(job_id)
     config = job["config"]
     format_name = (format_name or config.get("output_format") or "epub").lower()

@@ -8,7 +8,7 @@ import re
 from difflib import SequenceMatcher
 from typing import Any
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Comment, NavigableString, Tag
 
 MARKER_PATTERN = re.compile(r"⟦FC:[A-Z]+:[0-9a-f]{12}:[SEX]⟧")
 INLINE_TAGS = {"a", "b", "cite", "code", "em", "i", "ruby", "span", "strong", "sub", "sup", "u"}
@@ -26,6 +26,20 @@ def serialize_block(block: Tag, *, identity: str) -> tuple[str, list[dict[str, A
 
     def walk(node: Any, path: str) -> str:
         nonlocal visible_count
+        if isinstance(node, Comment) or (
+            isinstance(node, Tag)
+            and (node.name in {"script", "style", "template"} or node.has_attr("hidden"))
+        ):
+            token = _token("ATOM", f"{identity}:{path}:opaque:{len(markers)}", "X")
+            markers.append(
+                {
+                    "token": token,
+                    "html": f"<!--{node}-->" if isinstance(node, Comment) else str(node),
+                    "kind": "inline_atom",
+                    "source_offset": visible_count,
+                }
+            )
+            return token
         if isinstance(node, NavigableString):
             value = str(node)
             visible_count += len(value)

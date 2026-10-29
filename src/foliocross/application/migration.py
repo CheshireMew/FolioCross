@@ -196,6 +196,18 @@ def migrate_wenyi_state(
     state_dir: str,
     source_path: str,
 ) -> dict[str, Any]:
+    # Import, revisions, glossary, usage and completion receipt become visible
+    # together. A failed attempt leaves no imported-book guard blocking retry.
+    with service.workspace.transaction(immediate=True):
+        return _migrate_wenyi_state(service, state_dir=state_dir, source_path=source_path)
+
+
+def _migrate_wenyi_state(
+    service: FolioCrossService,
+    *,
+    state_dir: str,
+    source_path: str,
+) -> dict[str, Any]:
     source = Path(source_path).resolve()
     old_state = Path(state_dir).resolve()
     manifest_path = old_state / "manifest.json"
@@ -231,11 +243,9 @@ def migrate_wenyi_state(
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         report["report_path"] = str(report_path)
         return report
-    if service.repository.find_book_by_hash(actual_hash):
-        raise FolioCrossError(
-            "book_already_imported",
-            "这本书已经在 FolioCross 中。为避免覆盖现有版本，没有重复导入 Wenyi 状态。",
-        )
+    existing = service.repository.find_book_by_hash(actual_hash)
+    if existing:
+        _reset_unfinished_legacy_import(service, existing["id"], old_state)
 
     working_override = None
     if is_kindle_format(str(source)):
@@ -446,3 +456,82 @@ def migrate_wenyi_state(
         metadata={"source": "wenyi-v0.5.2", "read_only": True},
     )
     return report
+
+
+def _reset_unfinished_legacy_import(
+    service: FolioCrossService, book_id: str, old_state: Path
+) -> None:
+    """Recover pre-transaction import attempts, never edited/completed books.
+
+    This runs inside the new import transaction: any later failure also restores
+    the exact partial attempt. Files and source material are never removed.
+    """
+    repository = service.repository
+    job = repository.latest_job_for_book(book_id)
+    error = FolioCrossError(
+        "book_already_imported",
+        "这本书已经在 FolioCross 中。只有尚未完成、且没有后续编辑或运行的 Wenyi 导入才能重试。",
+    )
+    if (
+        not job
+        or job["config"].get("max_chars_per_segment") != 10_000_000
+        or job["stage"] not in {"imported", "migrated"}
+    ):
+        raise error
+    existing_terms = repository.list_glossary(job["id"])
+    if existing_terms:
+        glossary_path = old_state / "glossary.db"
+        if not glossary_path.is_file():
+            raise error
+        original = sqlite3.connect(f"file:{glossary_path.as_posix()}?mode=ro", uri=True)
+        try:
+            original_terms = set(original.execute("SELECT source,target FROM glossary").fetchall())
+        finally:
+            original.close()
+        if any((term["source"], term["target"]) not in original_terms for term in existing_terms):
+            raise error
+    with service.workspace.transaction(immediate=True) as connection:
+        job_id = job["id"]
+        if (
+            connection.execute("SELECT COUNT(*) FROM jobs WHERE book_id=?", (book_id,)).fetchone()[
+                0
+            ]
+            != 1
+        ):
+            raise error
+        disqualifiers = [
+            ("SELECT 1 FROM artifacts WHERE job_id=? AND kind='migration_report'", (job_id,)),
+            ("SELECT 1 FROM background_operations WHERE job_id=?", (job_id,)),
+            ("SELECT 1 FROM llm_requests WHERE job_id=? AND stage<>'wenyi_import'", (job_id,)),
+            ("SELECT 1 FROM glossary_terms WHERE job_id=? AND version>1", (job_id,)),
+            (
+                "SELECT 1 FROM review_issues WHERE job_id=? AND (category NOT IN ('migration','migration_structure') OR status<>'open')",
+                (job_id,),
+            ),
+            (
+                "SELECT 1 FROM segments s JOIN chapters c ON c.id=s.chapter_id WHERE c.book_id=? AND s.locked=1",
+                (book_id,),
+            ),
+            (
+                "SELECT 1 FROM segment_revisions r JOIN segments s ON s.id=r.segment_id JOIN chapters c ON c.id=s.chapter_id WHERE c.book_id=? AND r.origin NOT IN ('wenyi_translation','wenyi_final')",
+                (book_id,),
+            ),
+        ]
+        if any(connection.execute(sql, parameters).fetchone() for sql, parameters in disqualifiers):
+            raise error
+        # These rows have been proved to belong exclusively to a failed legacy
+        # import. Rebuild them together instead of duplicating versions/usage.
+        connection.execute(
+            "DELETE FROM segment_revisions WHERE segment_id IN (SELECT s.id FROM segments s JOIN chapters c ON c.id=s.chapter_id WHERE c.book_id=?)",
+            (book_id,),
+        )
+        connection.execute(
+            "UPDATE segments SET target_text='',version=0,status='pending',quality_json='{}' WHERE chapter_id IN (SELECT id FROM chapters WHERE book_id=?)",
+            (book_id,),
+        )
+        for table in ("review_issues", "glossary_candidates", "glossary_terms", "llm_requests"):
+            connection.execute(f"DELETE FROM {table} WHERE job_id=?", (job_id,))
+        connection.execute(
+            "UPDATE jobs SET completed_segments=0,actual_cost=0,glossary_snapshot_json='[]',glossary_snapshot_version=0,glossary_snapshot_at=NULL,book_context_json='{}' WHERE id=?",
+            (job_id,),
+        )

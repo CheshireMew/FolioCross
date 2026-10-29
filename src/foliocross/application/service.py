@@ -131,6 +131,10 @@ class FolioCrossService:
         if existing:
             previous_job = self.repository.latest_job_for_book(existing["id"])
             if previous_job:
+                from ..infrastructure.content_upgrade import ensure_html_coverage
+
+                ensure_html_coverage(self.repository, previous_job["id"])
+                previous_job = self.repository.get_job(previous_job["id"])
                 self.repository.unarchive_job(previous_job["id"])
                 return {
                     "ok": True,
@@ -233,14 +237,7 @@ class FolioCrossService:
     def export(
         self, job_id: str, format_name: str | None = None, output_path: str | None = None
     ) -> dict[str, Any]:
-        path = export_job(self.repository, job_id, format_name, output_path)
-        artifact_id = self.repository.add_artifact(
-            job_id,
-            kind="translation",
-            format_name=(format_name or Path(path).suffix.lstrip(".")),
-            path=path,
-        )
-        return {"ok": True, "artifact_id": artifact_id, "path": path}
+        return {"ok": True, **export_job(self.repository, job_id, format_name, output_path)}
 
     def edit_segment(
         self,
@@ -287,6 +284,12 @@ class FolioCrossService:
         target: str,
         *,
         apply_existing: bool = False,
+    ) -> dict[str, Any]:
+        with self.workspace.transaction(immediate=True):
+            return self._update_glossary(job_id, source, target, apply_existing=apply_existing)
+
+    def _update_glossary(
+        self, job_id: str, source: str, target: str, *, apply_existing: bool
     ) -> dict[str, Any]:
         result = self.repository.update_glossary_term(job_id, source, target)
         snapshot = self.repository.glossary_snapshot(job_id)

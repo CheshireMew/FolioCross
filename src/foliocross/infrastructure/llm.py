@@ -14,6 +14,13 @@ from ..errors import FolioCrossError
 from .credentials import CredentialStore
 
 
+def is_transport_error(error: Exception) -> bool:
+    from openai import APIConnectionError
+
+    # APITimeoutError inherits APIConnectionError, not built-in TimeoutError.
+    return isinstance(error, (APIConnectionError, TimeoutError, ConnectionError))
+
+
 @dataclass(slots=True)
 class ModelUsage:
     prompt_tokens: int = 0

@@ -1,6 +1,7 @@
 # 验收记录
 
-本页记录项目当前代码实际跑过的验收，不用提交名或功能列表代替结果证据。工作区中的原书、译文、
+本页保留各日期实际跑过的验收，不把历史记录当作当前版本已经通过的证明。2026-09-21 的审查修复
+与逐项验证见 [审查修复记录](audit-fixes.md)。工作区中的原书、译文、
 日志、数据库和迁移报告均被 Git 忽略。
 
 ## 原计划逐项核对（2026-09-05）
@@ -10,7 +11,7 @@
 
 | 原计划要求 | 当前实现与验证证据 |
 | --- | --- |
-| 独立项目、MIT/NOTICE、独立历史 | 根目录 LICENSE/NOTICE；本地 Git 无远程地址，workspace 无跟踪文件 |
+| 独立项目、MIT/NOTICE、独立历史 | 根目录 LICENSE/NOTICE；workspace 无跟踪文件。当前 origin 已配置为 CheshireMew/FolioCross；本轮未验收实时远端 |
 | EPUB、Kindle、FB2、HTML、TXT、MD、DOCX 输入 | 格式注册器、转换桥接；test_formats、test_conversion、test_calibre；真实 Kindle 缓存迁移及有效 EPUB 实跑 |
 | EPUB、DOCX、HTML、TXT、MD 输出 | test_committed_translation_reexports_to_all_output_formats；EPUB 模板与 DOCX 图片、列表、表格和未知包部件测试 |
 | DeepSeek Flash 直接翻译、thinking 关闭 | ModelProfile/JobConfig；真实请求使用 deepseek-v4-flash，3 段全流程完成 |

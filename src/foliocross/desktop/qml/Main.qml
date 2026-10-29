@@ -25,6 +25,7 @@ ApplicationWindow {
     property string pendingGlossarySource: ""
     property string pendingGlossaryTarget: ""
     property var reviewEstimate: ({})
+    property string previewPath: ""
     property string newJobId: ""
     property var affectedRows: []
     property string pendingIssueId: ""
@@ -221,6 +222,14 @@ ApplicationWindow {
             affectedRows = rows
             affectedDialog.open()
         }
+        function onReviewEstimateReady(jobId, result) {
+            if (backend.selectedJob.id !== jobId) return
+            reviewEstimate = result
+            if (result.ok) reviewDialog.open()
+        }
+        function onArtifactPreviewReady(path, text) {
+            if (previewPath === path) previewContent = text
+        }
     }
 
     Timer {
@@ -412,6 +421,7 @@ ApplicationWindow {
 
     Dialog {
         id: reviewDialog
+        objectName: "reviewDialog"
         modal: true
         width: 660
         anchors.centerIn: parent
@@ -499,6 +509,7 @@ ApplicationWindow {
 
     Dialog {
         id: previewDialog
+        objectName: "previewDialog"
         modal: true
         width: Math.min(window.width - 80, 920)
         height: Math.min(window.height - 80, 760)
@@ -1036,7 +1047,7 @@ ApplicationWindow {
                                     delegate: Rectangle {
                                         objectName: "segmentDelegate"
                                         required property var modelData
-                                        property int editVersion: modelData.version
+                                        property int editVersion: modelData.edit_version
                                         property bool manuallyLocked: modelData.locked
                                         width: ListView.view.width
                                         height: Math.max(230, editorRow.implicitHeight + 38)
@@ -1057,6 +1068,11 @@ ApplicationWindow {
                                                 Item { Layout.fillWidth: true }
                                                 ToolButton { text: tr("撤销", "Undo"); enabled: targetEdit.canUndo; onClicked: targetEdit.undo() }
                                                 ToolButton { text: tr("恢复", "Redo"); enabled: targetEdit.canRedo; onClicked: targetEdit.redo() }
+                                                ToolButton {
+                                                    text: tr("放弃草稿", "Discard draft")
+                                                    visible: targetEdit.dirty
+                                                    onClicked: { saveTimer.stop(); backend.discardDraft(modelData.id) }
+                                                }
                                                 ToolButton { text: tr("历史", "History"); onClicked: { historySegment = modelData.id; backend.segmentHistory(modelData.id) } }
                                                 ToolButton {
                                                     text: tr("重译", "Retranslate")
@@ -1096,13 +1112,19 @@ ApplicationWindow {
                                                             id: targetEdit
                                                             objectName: "translationEditor"
                                                             property string segmentId: modelData.id
-                                                            text: modelData.target_display_text
+                                                            property bool dirty: modelData.has_draft
+                                                            Component.onCompleted: if (dirty) saveTimer.restart()
+                                                            text: modelData.edit_text
                                                             placeholderText: tr("译文尚未生成", "Translation not generated")
                                                             wrapMode: TextEdit.Wrap
                                                             font.pixelSize: 15
                                                             background: null
                                                             selectByMouse: true
-                                                            onTextChanged: if (activeFocus) saveTimer.restart()
+                                                            onTextChanged: if (activeFocus) {
+                                                                dirty = true
+                                                                backend.setDraft(modelData.id, text, editVersion)
+                                                                saveTimer.restart()
+                                                            }
                                                             onActiveFocusChanged: {
                                                                 if (!activeFocus && saveTimer.running) {
                                                                     saveTimer.stop()
@@ -1114,6 +1136,7 @@ ApplicationWindow {
                                                                 if (savedVersion > editVersion) {
                                                                     editVersion = savedVersion
                                                                     manuallyLocked = true
+                                                                    dirty = false
                                                                 }
                                                             }
                                                             Keys.onPressed: function(event) {
@@ -1224,11 +1247,11 @@ ApplicationWindow {
                                     Label { text: tr("质量问题", "Quality issues"); font.pixelSize: 19; font.bold: true }
                                     Item { Layout.fillWidth: true }
                                     Button {
+                                        objectName: "deepReviewButton"
                                         text: tr("深度审校…", "Deep review…")
-                                        enabled: Number(backend.selectedJob.completed_segments || 0) > 0
+                                        enabled: !backend.busy && Number(backend.selectedJob.completed_segments || 0) > 0
                                         onClicked: {
-                                            reviewEstimate = backend.reviewEstimate(backend.selectedJob.id)
-                                            if (reviewEstimate.ok) reviewDialog.open()
+                                            backend.reviewEstimate(backend.selectedJob.id)
                                         }
                                     }
                                 }
@@ -1366,12 +1389,16 @@ ApplicationWindow {
                                             Label { text: modelData.format.toUpperCase(); color: "#c86a3b"; font.bold: true; Layout.preferredWidth: 80 }
                                             Label { text: modelData.path; Layout.fillWidth: true; elide: Text.ElideMiddle }
                                             Button {
+                                                objectName: "artifactPreviewButton"
+                                                property string artifactPath: modelData.path
                                                 visible: modelData.kind === "translation"
                                                 text: tr("预览", "Preview")
                                                 onClicked: {
                                                     previewTitle = modelData.format.toUpperCase() + tr(" 预览", " preview")
-                                                    previewContent = backend.previewArtifact(modelData.path)
-                                                    if (previewContent.length) previewDialog.open()
+                                                    previewPath = modelData.path
+                                                    previewContent = tr("正在读取…", "Loading…")
+                                                    previewDialog.open()
+                                                    backend.previewArtifact(modelData.path)
                                                 }
                                             }
                                             Button { text: tr("打开", "Open"); onClicked: backend.openPath(modelData.path) }

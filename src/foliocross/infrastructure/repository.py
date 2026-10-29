@@ -53,6 +53,9 @@ class Repository:
     def __init__(self, workspace: Workspace) -> None:
         self.workspace = workspace
         self.workspace.initialize()
+        from .artifact_publication import recover_publications
+
+        recover_publications(self)
 
     def recover_interrupted_jobs(self) -> list[str]:
         """Mark stale running states as resumable interruptions after an unclean exit."""
@@ -178,9 +181,22 @@ class Repository:
                         config.source_lang,
                         config.target_lang,
                         original_path,
-                        stored_source_path,
-                        working_source_path,
-                        json_text(parsed.metadata),
+                        self.workspace.store_path(stored_source_path),
+                        self.workspace.store_path(working_source_path),
+                        json_text(
+                            {
+                                **parsed.metadata,
+                                **(
+                                    {
+                                        "template_path": self.workspace.store_path(
+                                            parsed.metadata["template_path"]
+                                        )
+                                    }
+                                    if parsed.metadata.get("template_path")
+                                    else {}
+                                ),
+                            }
+                        ),
                         json_text(parsed.warnings),
                         now,
                         now,
@@ -273,6 +289,16 @@ class Repository:
                     {where} ORDER BY j.updated_at DESC"""
             ).fetchall()
         return [self._decode_job(dict(row)) for row in rows]
+
+    def detail_revision(self, job_id: str) -> tuple[int, int]:
+        with self.workspace.session() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(b.revision,0),COALESCE(j.revision,0) FROM jobs "
+                "LEFT JOIN projection_revisions b ON b.scope_id=jobs.book_id "
+                "LEFT JOIN projection_revisions j ON j.scope_id=jobs.id WHERE jobs.id=?",
+                (job_id,),
+            ).fetchone()
+        return tuple(row) if row else (0, 0)
 
     def archive_job(self, job_id: str) -> None:
         with self.workspace.transaction(immediate=True) as connection:
@@ -449,10 +475,22 @@ class Repository:
         *,
         activate: bool = False,
     ) -> dict[str, Any]:
-        allowed = {"run", "prepare", "review", "retranslate", "export"}
+        allowed = {
+            "run",
+            "prepare",
+            "review",
+            "retranslate",
+            "export",
+            "glossary",
+            "freeze_glossary",
+        }
         if action not in allowed:
             raise FolioCrossError("invalid_background_action", f"不支持的后台操作：{action}")
-        arguments = arguments or {}
+        arguments = dict(arguments or {})
+        if arguments.get("output_path"):
+            arguments["output_path"] = self.workspace.resolve_path(
+                self.workspace.store_path(arguments["output_path"])
+            )
         with self.workspace.transaction(immediate=True) as connection:
             if not connection.execute("SELECT 1 FROM jobs WHERE id=?", (job_id,)).fetchone():
                 raise FolioCrossError("job_not_found", f"找不到任务：{job_id}")
@@ -481,7 +519,23 @@ class Repository:
                 """INSERT INTO background_operations(
                     id,job_id,action,arguments_json,status,created_at
                 ) VALUES (?,?,?,?,?,?)""",
-                (operation_id, job_id, action, json_text(arguments), "queued", now),
+                (
+                    operation_id,
+                    job_id,
+                    action,
+                    json_text(
+                        {
+                            **arguments,
+                            **(
+                                {"output_path": self.workspace.store_path(arguments["output_path"])}
+                                if arguments.get("output_path")
+                                else {}
+                            ),
+                        }
+                    ),
+                    "queued",
+                    now,
+                ),
             )
             self._insert_event(
                 connection,
@@ -764,7 +818,7 @@ class Repository:
                         "issue_already_resolved", "该问题已经处理，请重新读取问题状态。"
                     )
             current = connection.execute(
-                "SELECT version,locked FROM segments WHERE id=?", (segment_id,)
+                "SELECT version,locked,target_text FROM segments WHERE id=?", (segment_id,)
             ).fetchone()
             if not current:
                 raise FolioCrossError("segment_not_found", f"找不到段落：{segment_id}")
@@ -804,13 +858,10 @@ class Repository:
                 ),
             )
             connection.execute(
-                """UPDATE jobs SET completed_segments=(
-                    SELECT COUNT(*) FROM segments s JOIN chapters c ON c.id=s.chapter_id
-                    WHERE c.book_id=jobs.book_id AND s.target_text<>''
-                ),updated_at=? WHERE book_id=(
+                """UPDATE jobs SET completed_segments=completed_segments+?,updated_at=? WHERE book_id=(
                     SELECT c.book_id FROM chapters c JOIN segments s ON s.chapter_id=c.id WHERE s.id=?
                 )""",
-                (now, segment_id),
+                (int(bool(text)) - int(bool(current["target_text"])), now, segment_id),
             )
         return version
 
@@ -1484,6 +1535,12 @@ class Repository:
         artifact_id = new_id()
         digest = sha256_file(path) if Path(path).is_file() else None
         with self.workspace.transaction(immediate=True) as connection:
+            existing = connection.execute(
+                "SELECT id FROM artifacts WHERE job_id=? AND kind=? AND path=? AND sha256=? AND available=1",
+                (job_id, kind, self.workspace.store_path(path), digest),
+            ).fetchone()
+            if existing:
+                return str(existing[0])
             connection.execute(
                 "INSERT INTO artifacts(id,job_id,kind,format,path,sha256,metadata_json,created_at) VALUES (?,?,?,?,?,?,?,?)",
                 (
@@ -1491,7 +1548,7 @@ class Repository:
                     job_id,
                     kind,
                     format_name,
-                    path,
+                    self.workspace.store_path(path),
                     digest,
                     json_text(metadata or {}),
                     utc_now(),
@@ -1502,12 +1559,18 @@ class Repository:
     def list_artifacts(self, job_id: str) -> list[dict[str, Any]]:
         with self.workspace.session() as connection:
             rows = connection.execute(
-                "SELECT * FROM artifacts WHERE job_id=? ORDER BY created_at DESC", (job_id,)
+                "SELECT * FROM artifacts WHERE job_id=? AND available=1 ORDER BY created_at DESC",
+                (job_id,),
             ).fetchall()
         result = []
         for row in rows:
             item = dict(row)
+            item["path"] = self.workspace.resolve_path(item["path"])
             item["metadata"] = decode_json(item.pop("metadata_json", "{}"), {})
+            if item["metadata"].get("delivery_path"):
+                item["metadata"]["delivery_path"] = self.workspace.resolve_path(
+                    item["metadata"]["delivery_path"]
+                )
             result.append(item)
         return result
 
@@ -1540,20 +1603,29 @@ class Repository:
         )
         return int(cursor.lastrowid)
 
-    @staticmethod
-    def _decode_book(item: dict[str, Any]) -> dict[str, Any]:
+    def _decode_book(self, item: dict[str, Any]) -> dict[str, Any]:
         item["metadata"] = decode_json(item.pop("metadata_json", "{}"), {})
+        self._resolve_book_paths(item)
         item["warnings"] = decode_json(item.pop("warnings_json", "[]"), [])
         item["archived"] = bool(item.get("archived"))
         return item
 
-    @staticmethod
-    def _decode_job(item: dict[str, Any]) -> dict[str, Any]:
+    def _resolve_book_paths(self, item: dict[str, Any]) -> None:
+        for key in ("stored_source_path", "working_source_path"):
+            if item.get(key):
+                item[key] = self.workspace.resolve_path(item[key])
+        if item.get("metadata", {}).get("template_path"):
+            item["metadata"]["template_path"] = self.workspace.resolve_path(
+                item["metadata"]["template_path"]
+            )
+
+    def _decode_job(self, item: dict[str, Any]) -> dict[str, Any]:
         item["config"] = decode_json(item.pop("config_json", "{}"), {})
         item["book_context"] = decode_json(item.pop("book_context_json", "{}"), {})
         item["glossary_snapshot"] = decode_json(item.pop("glossary_snapshot_json", "[]"), [])
         if "metadata_json" in item:
             item["metadata"] = decode_json(item.pop("metadata_json"), {})
+        self._resolve_book_paths(item)
         if "warnings_json" in item:
             item["warnings"] = decode_json(item.pop("warnings_json"), [])
         item["archived"] = bool(item.get("archived"))
@@ -1608,9 +1680,12 @@ class Repository:
         )
         return item
 
-    @staticmethod
-    def _decode_background_operation(item: dict[str, Any]) -> dict[str, Any]:
+    def _decode_background_operation(self, item: dict[str, Any]) -> dict[str, Any]:
         item["arguments"] = decode_json(item.pop("arguments_json", "{}"), {})
+        if item["arguments"].get("output_path"):
+            item["arguments"]["output_path"] = self.workspace.resolve_path(
+                item["arguments"]["output_path"]
+            )
         item["cancel_requested"] = bool(item.get("cancel_requested"))
         return item
 

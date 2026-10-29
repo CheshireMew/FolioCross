@@ -5,12 +5,9 @@ from __future__ import annotations
 import json
 import re
 import sys
-import zipfile
 from pathlib import Path
 from typing import Any, Callable
 
-from bs4 import BeautifulSoup
-from docx import Document
 from PySide6.QtCore import Property, QObject, QProcess, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QDesktopServices
 
@@ -76,12 +73,15 @@ RUNTIME_TEXT_EN = {
 class DesktopController(QObject):
     jobsChanged = Signal()
     detailsChanged = Signal()
+    segmentsChanged = Signal()
     busyChanged = Signal()
     message = Signal(str, str)
     importFinished = Signal(str)
     workerEvent = Signal(str, str)
     historyReady = Signal("QVariantList")
     affectedSegmentsReady = Signal("QVariantList")
+    reviewEstimateReady = Signal(str, "QVariantMap")
+    artifactPreviewReady = Signal(str, str)
     languageChanged = Signal()
     scaleChanged = Signal()
     themeChanged = Signal()
@@ -98,6 +98,8 @@ class DesktopController(QObject):
         self._scheduler_starter = scheduler_starter or ensure_scheduler
         self._jobs: list[dict[str, Any]] = []
         self._selected: dict[str, Any] = {}
+        self._details_revision = (0, 0)
+        self._drafts: dict[str, dict[str, Any]] = {}
         self._chapters: list[dict[str, Any]] = []
         self._segments: list[dict[str, Any]] = []
         self._selected_chapter_id = ""
@@ -141,7 +143,7 @@ class DesktopController(QObject):
     def chapters(self):
         return self._chapters
 
-    @Property("QVariantList", notify=detailsChanged)
+    @Property("QVariantList", notify=segmentsChanged)
     def segments(self):
         return self._segments
 
@@ -333,6 +335,9 @@ class DesktopController(QObject):
         current = next((job for job in jobs if job["id"] == selected_id), None)
         if current is None:
             return
+        if self.service.repository.detail_revision(selected_id) != self._details_revision:
+            self.selectJob(selected_id)
+            return
         changed = (current["status"], current["stage"], current["completed_segments"])
         if previous[:2] != changed[:2] and current["status"] in {
             "completed",
@@ -373,17 +378,22 @@ class DesktopController(QObject):
             result["message"] = self.localizeText(result["message"])
         return result
 
-    @staticmethod
-    def _segments_for_display(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _segments_for_display(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for row in rows:
             row["source_display_text"] = strip_protected_markers(row.get("source_text", ""))
             row["target_display_text"] = strip_protected_markers(row.get("target_text", ""))
+            draft = self._drafts.get(row["id"])
+            row["edit_text"] = draft["text"] if draft else row["target_display_text"]
+            row["edit_version"] = draft["version"] if draft else row["version"]
+            row["has_draft"] = bool(draft)
         return rows
 
     @Slot(str)
     def selectJob(self, job_id: str) -> None:
         try:
             changed_job = job_id != self._selected.get("id")
+            previous_segments = self._segments
+            self._details_revision = self.service.repository.detail_revision(job_id)
             self._selected = self.service.repository.get_job(job_id)
             self._selected.pop("glossary_snapshot", None)
             operation = self.service.repository.active_background_operation(job_id)
@@ -406,7 +416,8 @@ class DesktopController(QObject):
             self._steps = self.service.repository.job_steps(job_id)
             for step in self._steps:
                 step["display_message"] = self.localizeText(step.get("message", ""))
-            self.service.repository.set_setting("last_job_id", job_id)
+            if changed_job:
+                self.service.repository.set_setting("last_job_id", job_id)
             if self._chapters:
                 preferred = str(
                     self.service.repository.get_setting(f"last_chapter:{job_id}", "") or ""
@@ -422,6 +433,8 @@ class DesktopController(QObject):
             else:
                 self._selected_chapter_id = ""
                 self._segments = []
+            if self._segments != previous_segments:
+                self.segmentsChanged.emit()
             self.detailsChanged.emit()
         except FolioCrossError as error:
             self.message.emit("error", error.localized(self._language))
@@ -460,6 +473,7 @@ class DesktopController(QObject):
             self.service.repository.segments_for_chapter(chapter_id)
         )
         self._selected_chapter_id = chapter_id
+        self.segmentsChanged.emit()
         if self._selected:
             self.service.repository.set_setting(f"last_chapter:{self._selected['id']}", chapter_id)
         self.detailsChanged.emit()
@@ -674,6 +688,7 @@ class DesktopController(QObject):
             self._selected = {}
             self._chapters = []
             self._segments = []
+            self.segmentsChanged.emit()
             self._selected_chapter_id = ""
             self._glossary = []
             self._glossary_total = 0
@@ -714,17 +729,35 @@ class DesktopController(QObject):
             result = self.service.edit_segment(
                 segment_id, internal_text, expected_version=expected_version
             )
+            self._drafts.pop(segment_id, None)
             for segment in self._segments:
                 if segment["id"] == segment_id:
                     segment["target_text"] = internal_text
                     segment["target_display_text"] = strip_protected_markers(internal_text)
                     segment["version"] = result["version"]
+                    segment["edit_text"] = text
+                    segment["edit_version"] = result["version"]
+                    segment["has_draft"] = False
                     segment["locked"] = True
                     break
             return int(result["version"])
         except FolioCrossError as error:
             self.message.emit("error", error.message)
             return -1
+
+    @Slot(str, str, int)
+    def setDraft(self, segment_id: str, text: str, expected_version: int) -> None:
+        self._drafts[segment_id] = {"text": text, "version": expected_version}
+        for segment in self._segments:
+            if segment["id"] == segment_id:
+                segment.update(edit_text=text, edit_version=expected_version, has_draft=True)
+                break
+
+    @Slot(str)
+    def discardDraft(self, segment_id: str) -> None:
+        self._drafts.pop(segment_id, None)
+        if self._selected:
+            self.selectJob(self._selected["id"])
 
     @Slot(str)
     def segmentHistory(self, segment_id: str) -> None:
@@ -752,18 +785,12 @@ class DesktopController(QObject):
     def saveGlossary(
         self, job_id: str, source: str, target: str, apply_existing: bool = False
     ) -> None:
-        try:
-            result = self.service.update_glossary(
-                job_id, source, target, apply_existing=apply_existing
-            )
-            if apply_existing:
-                message = f"术语已保存，并修改 {result['applied_segments']} 个已有译文段落。"
-            else:
-                message = f"术语已保存，影响 {result['affected_segments']} 个段落。"
-            self.message.emit("success", message)
-            self.selectJob(job_id)
-        except FolioCrossError as error:
-            self.message.emit("error", error.message)
+        self._queue_background_action(
+            job_id=job_id,
+            action="glossary",
+            arguments={"source": source, "target": target, "apply_existing": apply_existing},
+            success_message="术语修改已进入后台队列，完成后会自动刷新。",
+        )
 
     @Slot(str, str)
     def resolveIssue(self, issue_id: str, status: str) -> None:
@@ -787,27 +814,32 @@ class DesktopController(QObject):
 
     @Slot(str, str)
     def showAffectedSegments(self, job_id: str, source: str) -> None:
-        rows = self.service.repository.affected_segments(job_id, source)
-        self.affectedSegmentsReady.emit(self._segments_for_display(rows))
+        self._start_query(
+            "affected",
+            {"job_id": job_id, "source": source},
+            lambda result: (
+                self.affectedSegmentsReady.emit(self._segments_for_display(result["rows"]))
+                if self._selected.get("id") == job_id
+                else None
+            ),
+        )
 
     @Slot(str)
     def refreshGlossarySnapshot(self, job_id: str) -> None:
-        try:
-            result = self.service.refresh_glossary_snapshot(job_id)
-            self.message.emit(
-                "success", f"已冻结术语版本 {result['version']}，共 {len(result['terms'])} 条。"
-            )
-            self.selectJob(job_id)
-        except FolioCrossError as error:
-            self.message.emit("error", error.message)
+        self._queue_background_action(
+            job_id=job_id,
+            action="freeze_glossary",
+            arguments={},
+            success_message="术语冻结已进入后台队列。",
+        )
 
-    @Slot(str, result="QVariantMap")
+    @Slot(str)
     def reviewEstimate(self, job_id: str):
-        try:
-            return self.service.estimate_deep_review(job_id)
-        except FolioCrossError as error:
-            self.message.emit("error", error.message)
-            return {"ok": False, "error": error.message}
+        self._start_query(
+            "review_estimate",
+            {"job_id": job_id},
+            lambda result: self.reviewEstimateReady.emit(job_id, result),
+        )
 
     @Slot(str)
     def startDeepReview(self, job_id: str) -> None:
@@ -846,46 +878,60 @@ class DesktopController(QObject):
         if path:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).resolve().parent)))
 
-    @Slot(str, result=str)
-    def previewArtifact(self, path: str) -> str:
-        source = Path(path)
-        try:
-            suffix = source.suffix.lower()
-            if suffix in {".txt", ".md", ".markdown"}:
-                text = source.read_text(encoding="utf-8-sig")
-            elif suffix in {".html", ".htm"}:
-                text = BeautifulSoup(source.read_bytes(), "lxml").get_text("\n", strip=True)
-            elif suffix == ".docx":
-                document = Document(source)
-                values = [paragraph.text for paragraph in document.paragraphs]
-                values.extend(
-                    paragraph.text
-                    for table in document.tables
-                    for row in table.rows
-                    for cell in row.cells
-                    for paragraph in cell.paragraphs
-                )
-                text = "\n\n".join(value for value in values if value.strip())
-            elif suffix == ".epub":
-                pieces: list[str] = []
-                with zipfile.ZipFile(source) as archive:
-                    for name in archive.namelist():
-                        if Path(name).suffix.lower() not in {".xhtml", ".html", ".htm"}:
-                            continue
-                        visible = BeautifulSoup(archive.read(name), "lxml").get_text(
-                            "\n", strip=True
-                        )
-                        if visible:
-                            pieces.append(visible)
-                        if sum(len(item) for item in pieces) >= 40_000:
-                            break
-                text = "\n\n".join(pieces)
+    @Slot(str)
+    def previewArtifact(self, path: str) -> None:
+        self._start_query(
+            "preview",
+            {"path": path},
+            lambda result: self.artifactPreviewReady.emit(path, result["text"]),
+        )
+
+    def _start_query(self, action: str, arguments: dict, on_result: Callable) -> None:
+        key = "query:" + action + ":" + json.dumps(arguments, sort_keys=True)
+        if key in self._processes:
+            return
+        process = QProcess(self)
+        self._processes[key] = process
+        self._set_busy(True)
+        process.setProgram(sys.executable)
+        process.setArguments(
+            [
+                "-m",
+                "foliocross.desktop.query_worker",
+                "--workspace",
+                str(self.workspace.root),
+                "--action",
+                action,
+                "--arguments",
+                json.dumps(arguments, ensure_ascii=True),
+            ]
+        )
+        if action == "review_estimate":
+            self.message.emit("info", "正在估算审校费用…")
+
+        def finished(*unused):
+            if self._processes.pop(key, None) is None:
+                return
+            raw = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace").strip()
+            self._set_busy(bool(self._processes))
+            try:
+                result = json.loads(raw.splitlines()[-1])
+            except (json.JSONDecodeError, IndexError):
+                result = {"ok": False, "error": {"message": "后台读取失败，请重试。"}}
+            if result.get("ok"):
+                on_result(result)
             else:
-                raise FolioCrossError("preview_unsupported", "这种文件暂不支持应用内预览。")
-            return text[:40_000]
-        except (OSError, zipfile.BadZipFile, ValueError) as error:
-            self.message.emit("error", f"预览失败：{error}")
-            return ""
+                error = result.get("error", {}).get("message", "后台读取失败。")
+                self.message.emit("error", error)
+                if action == "preview":
+                    self.artifactPreviewReady.emit(arguments["path"], "预览失败：" + error)
+            process.deleteLater()
+
+        process.finished.connect(finished)
+        process.errorOccurred.connect(
+            lambda error: finished() if error == QProcess.FailedToStart else None
+        )
+        process.start()
 
     @Slot(str, str)
     def saveApiKey(self, profile_id: str, api_key: str) -> None:

@@ -21,10 +21,22 @@ def main() -> None:
     parser.add_argument("--export-format")
     parser.add_argument("--output")
     parser.add_argument("--expected-version", type=int)
+    parser.add_argument("--glossary-source")
+    parser.add_argument("--glossary-target", default="")
+    parser.add_argument("--apply-existing", action="store_true")
+    parser.add_argument("--freeze-glossary", action="store_true")
     args = parser.parse_args()
     try:
         engine = WorkerEngine(Workspace(args.workspace), event_sink=stdout_event_sink)
-        if args.review:
+        if args.glossary_source is not None or args.freeze_glossary:
+            result = engine.update_glossary(
+                args.job,
+                args.glossary_source,
+                args.glossary_target,
+                apply_existing=args.apply_existing,
+                freeze=args.freeze_glossary,
+            )
+        elif args.review:
             result = engine.deep_review(args.job)
         elif args.prepare_only:
             result = engine.prepare_only(args.job)

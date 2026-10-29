@@ -9,6 +9,7 @@ import zipfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import unquote, urlsplit
 from xml.etree import ElementTree as ET
 
 from bs4 import BeautifulSoup
@@ -32,6 +33,14 @@ def _resolved_resource(owner: str, href: str) -> str:
     if not clean:
         return owner
     return posixpath.normpath(posixpath.join(posixpath.dirname(owner), clean))
+
+
+def _navigation_target(owner: str, href: str) -> str:
+    parsed = urlsplit(href)
+    if parsed.scheme or parsed.netloc:
+        return ""
+    resource = _resolved_resource(owner, unquote(parsed.path))
+    return f"{resource}#{unquote(parsed.fragment)}" if parsed.fragment else resource
 
 
 def _linked_note_resources(data: bytes, owner: str) -> list[str]:
@@ -74,17 +83,18 @@ def _update_navigation_documents(
         soup = BeautifulSoup(path.read_bytes(), "lxml-xml")
         if "nav" in properties:
             for anchor in soup.find_all("a", href=True):
-                label = labels.get(_resolved_resource(owner, str(anchor["href"])))
+                label = labels.get(_navigation_target(owner, str(anchor["href"])))
                 if label:
                     anchor.clear()
                     anchor.append(label)
         else:
             for point in soup.find_all("navPoint"):
-                content = point.find("content", src=True)
-                text = point.find("text")
+                content = point.find("content", src=True, recursive=False)
+                nav_label = point.find("navLabel", recursive=False)
+                text = nav_label.find("text") if nav_label else None
                 if content is None or text is None:
                     continue
-                label = labels.get(_resolved_resource(owner, str(content["src"])))
+                label = labels.get(_navigation_target(owner, str(content["src"])))
                 if label:
                     text.string = label
         path.write_bytes(str(soup).encode("utf-8"))
@@ -171,7 +181,7 @@ def parse_epub(path: str, source_lang: str = "auto") -> ParsedBook:
         "epub",
         detected_lang,
         chapters,
-        {"template_path": str(Path(path).resolve())},
+        {"template_path": str(Path(path).resolve()), "extraction_version": 2},
     )
 
 
@@ -191,9 +201,6 @@ def export_epub_template(
         if not resource or "ordinal" not in locator:
             raise FolioCrossError("epub_mapping_incomplete", "有段落缺少有效的 EPUB 原位定位信息。")
         by_resource[resource][int(locator["ordinal"])].append(segment)
-        tag = str(locator.get("tag", "")).lower()
-        if tag.startswith("h") and resource not in navigation_labels:
-            navigation_labels[resource] = _navigation_label([segment])
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     with (
@@ -208,7 +215,7 @@ def export_epub_template(
                 raise FolioCrossError("epub_mapping_incomplete", f"EPUB 正文资源已丢失：{resource}")
             soup = BeautifulSoup(resource_path.read_bytes(), "lxml-xml")
             blocks = content_blocks(soup)
-            for ordinal, parts in groups.items():
+            for ordinal, parts in sorted(groups.items()):
                 if ordinal < 0 or ordinal >= len(blocks):
                     raise FolioCrossError(
                         "epub_mapping_incomplete",
@@ -217,7 +224,10 @@ def export_epub_template(
                 parts.sort(key=lambda item: int(item["locator"].get("logical_part", 0)))
                 target = "".join(item["target_text"] or item["source_text"] for item in parts)
                 source_text = "".join(item["source_text"] for item in parts)
-                fresh_source, _ = serialize_block(blocks[ordinal], identity=f"{resource}:{ordinal}")
+                fresh_source, _ = serialize_block(
+                    blocks[ordinal],
+                    identity=parts[0]["locator"].get("marker_identity", f"{resource}:{ordinal}"),
+                )
                 if fresh_source != source_text:
                     raise FolioCrossError(
                         "epub_source_changed",
@@ -226,9 +236,20 @@ def export_epub_template(
                 if bilingual:
                     target = f"{target}\n{source_text}"
                 markers = [marker for item in parts for marker in item["markers"]]
+                block = blocks[ordinal]
+                label = _navigation_label(parts)
+                # IDs may be on a heading, an inline anchor or its containing
+                # section. The first translated block owns a container label.
+                for node in [block, *block.find_all(True), *block.parents]:
+                    anchor_id = node.get("id") or node.get("name")
+                    if anchor_id:
+                        navigation_labels.setdefault(f"{resource}#{anchor_id}", label)
                 replace_block_contents(blocks[ordinal], target, markers)
-                if str(parts[0]["locator"].get("tag", "")).lower().startswith("h"):
-                    navigation_labels[resource] = _navigation_label(parts)
+                if (
+                    block.name in {"h1", "h2", "h3", "h4", "h5", "h6"}
+                    and resource not in navigation_labels
+                ):
+                    navigation_labels[resource] = label
                     title = soup.find("title")
                     if title is not None:
                         title.string = navigation_labels[resource]
